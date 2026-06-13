@@ -1,0 +1,116 @@
+# Left Jab Harness — CI pipeline (Azure DevOps, GitHub-hosted source)
+#
+# Lints (shellcheck) and tests (self-contained bash suites) the harness, then builds the
+# runtime container image. On `main` it also pushes the image to the configured registry.
+#
+# This pipeline is ADO-built but the source lives in a public GitHub repo, so company-
+# specific values are NOT committed here — they are supplied as PIPELINE VARIABLES on the
+# build definition (or a linked variable group). This keeps the public repo free of any
+# environment configuration. Define these when you create the pipeline
+# (see src/build/pr-bot/docs/pipeline-setup.md):
+#
+#   dockerRegistryServiceConnection  - ADO docker-registry service connection name
+#   containerRegistry                - container registry login server (e.g. <name>.azurecr.io)
+#   imageRepository                  - image repository/name (e.g. left-jab-harness)
+#
+# Build-only on PRs; build + push on main (mirrors the house PublishArtifact pattern).
+# Native GitHub Actions are intentionally out of scope — there is no .github/workflows/.
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - src/build/**
+      - azure-pipelines.yml
+
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - src/build/**
+      - azure-pipelines.yml
+
+resources:
+  - repo: self
+
+variables:
+  vmImageName: 'ubuntu-latest'
+  dockerfilePath: 'src/build/pr-bot/Dockerfile'
+  # Image is tagged by commit (decision: "tagged by commit").
+  tag: '$(Build.SourceVersion)'
+  ${{ if eq(variables['Build.Reason'], 'PullRequest') }}:
+    dockerCommand: 'build'
+  ${{ else }}:
+    dockerCommand: 'buildAndPush'
+
+stages:
+  - stage: Validate
+    displayName: 'Lint & Test'
+    jobs:
+      - job: LintTest
+        displayName: 'shellcheck + bash suites'
+        pool:
+          vmImage: $(vmImageName)
+        steps:
+          - checkout: self
+            fetchDepth: 1
+
+          - script: |
+              set -euo pipefail
+              sudo apt-get update
+              sudo apt-get install -y --no-install-recommends shellcheck
+              shellcheck --version
+            displayName: 'Install shellcheck'
+
+          - script: |
+              set -euo pipefail
+              # All shell scripts (the credential helper has no .sh extension — include it).
+              mapfile -t files < <(find src/build -type f -name '*.sh' | sort)
+              [ -f src/build/git-credential-ado-pat ] && files+=("src/build/git-credential-ado-pat")
+              echo "Linting ${#files[@]} scripts:"; printf '  %s\n' "${files[@]}"
+              shellcheck --severity=error "${files[@]}"
+            displayName: 'shellcheck (severity=error)'
+
+          - script: |
+              set -euo pipefail
+              # The suites are self-contained: they extract and exercise the real shipped
+              # functions and need no live services. Any non-zero fails the stage.
+              fail=0
+              shopt -s nullglob
+              for t in src/build/test/*.sh; do
+                echo "=== $t ==="
+                bash "$t" || fail=1
+              done
+              exit "$fail"
+            displayName: 'Run bash test suites'
+
+  - stage: Build
+    displayName: 'Build container image'
+    dependsOn: Validate
+    condition: succeeded()
+    jobs:
+      - job: BuildImage
+        displayName: 'docker build (push on main)'
+        pool:
+          vmImage: $(vmImageName)
+        steps:
+          - checkout: self
+            fetchDepth: 1
+
+          - task: Docker@2
+            displayName: 'Build harness image (and push on main)'
+            inputs:
+              command: $(dockerCommand)
+              repository: $(imageRepository)
+              dockerfile: $(dockerfilePath)
+              # Build context = repo root so COPY src/build resolves and root .dockerignore
+              # (secret/state exclusions) is honored.
+              buildContext: '$(Build.SourcesDirectory)'
+              containerRegistry: $(dockerRegistryServiceConnection)
+              tags: |
+                $(tag)
+                latest
