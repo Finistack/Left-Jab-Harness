@@ -19,6 +19,9 @@ PR events and drives the ADO REST API. The harness runs from its own checkout an
   Workload Identity Federation.
 - **Multi-host safe** — a distributed lease (stored as an ADO PR comment) prevents two hosts from
   double-processing the same PR.
+- **AI PR review (GitHub)** — a separate ADO-built pipeline runs a Claude Code review on GitHub
+  PRs and posts findings back (inline comments, thread resolution, and a real `APPROVE` when
+  clean) via the GitHub REST + GraphQL APIs.
 
 ## Quick start
 
@@ -47,6 +50,8 @@ configuration reference and [`ARCHITECTURE.md`](./ARCHITECTURE.md) for how it wo
 | `src/build/pr-bot/` | The daemon (`start.sh`) and per-PR orchestrator (`pr_router.sh`) + helpers |
 | `src/build/shared/` | Pluggable ADO auth + API + worktree + logging helpers |
 | `src/build/test/` | Self-contained unit tests |
+| `claude-pr-review-pipeline.yml` | ADO pipeline that AI-reviews **GitHub** PRs (separate from the lint/test/build pipeline) |
+| `src/build/github-pr-review.py` | GitHub PR-review poster (REST + GraphQL; stdlib-only Python) |
 
 ## Security
 

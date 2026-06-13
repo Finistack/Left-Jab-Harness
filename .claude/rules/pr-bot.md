@@ -62,6 +62,9 @@ A `*-wip` source branch is treated like `[no-bot]` (Tier 2 standdown). PRs witho
 | `src/build/pr-bot/config.env` | Runtime configuration (`TARGET_REPO_DIR`, auth, `NTFY_URL`, `MEMORY_BUDGET_MB`, `MAX_CONCURRENT`, etc.) — gitignored; copy from `config.env.example` |
 | `src/build/shared/ado_auth.sh` | Pluggable ADO auth — `pat`, `entra-sp`, `entra-wi` |
 | `src/build/shared/ado_api.sh` | Shared `ado_api_call()` with retry/backoff |
+| `claude-pr-review-pipeline.yml` | **CI-side** GitHub PR-review pipeline (separate from the daemon; see [`ci-review.md`](./ci-review.md)) |
+| `src/build/github-pr-review.py` | **CI-side** GitHub review poster — REST + GraphQL, stdlib-only Python |
+| `src/build/test/github-pr-review-test.sh` | Pure-function unit test for the GitHub poster (shells to `python3`) |
 
 ## Deploying Changes
 
