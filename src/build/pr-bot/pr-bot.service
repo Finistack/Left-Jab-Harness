@@ -1,0 +1,32 @@
+[Unit]
+Description=Finistack PR Bot — auto-addresses PR review comments via Claude Code
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+NotifyAccess=all
+ExecStart=%h/src/build/pr-bot/start.sh --service
+WorkingDirectory=%h/src/build/pr-bot
+EnvironmentFile=%h/src/build/pr-bot/config.env
+Restart=on-failure
+RestartSec=10
+WatchdogSec=300
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pr-bot
+
+# Resource limits
+LimitNOFILE=4096
+# Hard memory wall. KillMode=control-group means exceeding this OOM-kills the
+# WHOLE bot (all in-flight routers), so the app-level admission budget
+# (MEMORY_BUDGET_MB in config.env/start.sh) is set ~370MB UNDER this to defer or
+# trim before systemd does. The installed unit already ran at 3G; this file is
+# reconciled to match so a reinstall doesn't silently tighten the cap to 2G.
+MemoryMax=3G
+# Give the OOM killer a chance to reap a single child instead of the cgroup when
+# possible, and make kills predictable.
+KillMode=control-group
+
+[Install]
+WantedBy=default.target

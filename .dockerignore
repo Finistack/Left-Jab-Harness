@@ -1,0 +1,29 @@
+# Build context = repo root. Keep the image lean AND secret-free.
+# Anything that could carry secrets, runtime state, or local cruft is excluded
+# here as defense-in-depth on top of .gitignore (the build context can include
+# gitignored files, so this list is load-bearing for not baking secrets in).
+
+# --- Secrets & runtime config (NEVER bake into a public image) ---
+**/.secrets.env
+**/config.env
+**/*.local
+
+# --- Bot runtime state (locks, leases, worktrees, logs, queue) ---
+**/.pr-bot-state/
+**/*.log
+
+# --- VCS / tooling ---
+.git
+.gitignore
+.dockerignore
+.claude/
+.vscode/
+
+# --- Docs & meta (not needed at runtime) ---
+**/*.md
+LICENSE
+ARCHITECTURE.md
+docs/
+
+# --- CI definitions ---
+azure-pipelines.yml

@@ -1,0 +1,20 @@
+# ── Secrets & runtime config (NEVER commit) ──
+.secrets.env
+**/.secrets.env
+config.env
+**/config.env
+*.local
+*.local.env
+
+# ── Bot runtime state ──
+.pr-bot-state/
+**/.pr-bot-state/
+*.log
+
+# ── OS / editor noise ──
+.DS_Store
+*.swp
+*~
+
+# ── Worktrees (Claude Code) ──
+.claude/worktrees/
