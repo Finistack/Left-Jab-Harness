@@ -32,15 +32,17 @@ trigger:
       - azure-pipelines.yml
 
 # Daily rebuild so base-image (mcr.microsoft.com/dotnet/sdk) + apt/Node/Claude-CLI security
-# updates land without a code change. always:false => skipped when no commits since the last
-# successful scheduled run (no churn of identical images).
+# updates land even when the harness source is unchanged. always:true is required for that:
+# always:false skips the run whenever there are no new commits — exactly the case a security
+# refresh must still cover — which would also make this schedule redundant with the main CI
+# trigger above. The daily tag increment is the intended cost of a freshly patched image.
 schedules:
   - cron: '17 7 * * *'
-    displayName: Daily bot image (if changed)
+    displayName: Daily bot image (security refresh)
     branches:
       include:
         - main
-    always: false
+    always: true
 
 pr:
   branches:
@@ -133,6 +135,9 @@ stages:
               # (secret/state exclusions) is honored.
               buildContext: '$(Build.SourcesDirectory)'
               containerRegistry: $(dockerRegistryServiceConnection)
+              # Tag with both the semver (chart-pinnable) and the commit SHA (traceability:
+              # the monotonic counter alone can't map an image back to its source commit).
               tags: |
                 $(imageTag)
+                $(Build.SourceVersion)
                 latest
