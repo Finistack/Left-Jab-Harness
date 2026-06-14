@@ -45,6 +45,35 @@ Background loops in `start.sh`:
 Full operational detail (memory layers, the `read` exit-code contract, marker semantics, yield
 handling, self-healing after OOM) is in [`.claude/rules/pr-bot.md`](./.claude/rules/pr-bot.md).
 
+## CI-side: Claude PR review (GitHub)
+
+Separate from the client-side daemon above, the repo ships a **CI-side** AI reviewer: an
+Azure-DevOps-built pipeline that reviews **GitHub** pull requests and writes findings back to
+the PR. The daemon *services* an ADO repo from a long-running host; this pipeline *reviews* a
+GitHub PR per build and exits.
+
+```
+GitHub PR  ──webhook──►  ADO pipeline (claude-pr-review-pipeline.yml)
+                              │  git diff origin/<target>...HEAD
+                              ▼
+                         claude -p (diff)  ──JSON──►  github-pr-review.py
+                                                          │  REST writes + GraphQL thread state
+                                                          ▼
+                                        GitHub PR  (inline comments / resolve / approve)
+```
+
+| Property | Where | Why |
+|----------|-------|-----|
+| **Separate pipeline** | `claude-pr-review-pipeline.yml` (definition `left-jab-harness-review`) | Distinct from the lint/test/build pipeline; the `pr:` block is its trigger (a GitHub webhook via the ADO connection). |
+| **GitHub thread model** | `github-pr-review.py` | Resolution state + thread node-ids are **GraphQL-only**; bodies/paths/authors come over REST. Writes are REST; correlation is `databaseId == REST id`. |
+| **Separate bot identity** | `GH_REVIEW_PAT` (ADO pipeline secret) | A clean review casts a real `APPROVE`; GitHub forbids self-approval (422), so a distinct **Write**-collaborator bot account is required. |
+| **Non-blocking** | never submits `REQUEST_CHANGES`; review check left non-required | Mirrors the ADO original's `isBlocking=false`; merges stay gated by the existing required check + human approval. |
+
+Full detail — the 7-step poster flow, the ADO→GitHub API mapping, and YAML gotchas — is in
+[`.claude/rules/ci-review.md`](./.claude/rules/ci-review.md); provisioning (bot account, PAT,
+`az` steps, branch protection) is in
+[`src/build/pr-bot/docs/claude-review-pipeline-setup.md`](./src/build/pr-bot/docs/claude-review-pipeline-setup.md).
+
 ## Server side (out of scope for this repo)
 
 The event relay, container image, daemonset/Helm chart, multi-tenant resource provider, auth

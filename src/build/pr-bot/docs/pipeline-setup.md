@@ -7,6 +7,11 @@ suites, and builds the runtime container image — pushing it to a registry on `
 > Native GitHub Actions are intentionally **out of scope**: there is no `.github/workflows/`.
 > CI is ADO-built against the GitHub source via an ADO **GitHub service connection**.
 
+> **Related pipeline:** a *second*, separate ADO definition runs a Claude Code **AI review** on
+> GitHub PRs and posts findings back — see
+> [`claude-review-pipeline-setup.md`](./claude-review-pipeline-setup.md). This page covers only
+> the lint/test/build pipeline (`left-jab-harness`).
+
 The public repo contains **no environment-specific values**. Everything site-specific is
 supplied as **pipeline variables** (or a linked variable group) on the build definition.
 

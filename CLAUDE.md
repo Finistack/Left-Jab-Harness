@@ -22,11 +22,16 @@ monorepo (`src/build/...`) so it can be consumed by monorepo-style builds, and i
 | `src/build/pr-bot/` | The bot daemon + per-PR orchestrator (bash) |
 | `src/build/shared/` | Shared ADO auth (`pat`/`entra-sp`/`entra-wi`) + API + worktree + logging helpers |
 | `src/build/test/` | Self-contained unit tests (extract and exercise the real shipped functions) |
+| `claude-pr-review-pipeline.yml` | ADO pipeline that AI-reviews **GitHub** PRs (separate from `azure-pipelines.yml`) |
+| `src/build/github-pr-review.py` | GitHub PR-review poster — REST + GraphQL, stdlib-only Python |
 
 ### Stack & dependencies
-- **Language:** Bash (4.3+). No package manifest.
+- **Language:** Bash (4.3+). No package manifest. (One exception: `src/build/github-pr-review.py`,
+  the CI-side GitHub review poster — stdlib-only Python, no pip deps.)
 - **Runtime deps:** `git`, `curl`, `jq`, and the `claude` CLI (Claude Code).
 - **Auth:** Azure DevOps via PAT, Entra service principal, or Workload Identity (`ADO_AUTH_METHOD`).
+  The GitHub review pipeline authenticates as a separate **review bot** via `GH_REVIEW_PAT`, an
+  ADO **pipeline** secret — never committed (set on the build definition; see Secrets below).
 
 ---
 
@@ -56,6 +61,9 @@ This is a **public** repository. Never commit secrets or environment-specific va
 - **Runtime config** → `src/build/pr-bot/config.env` (gitignored). Only `config.env.example`
   (placeholders) is committed.
 - **State** → `.pr-bot-state/` (gitignored): locks, leases, worktrees, logs.
+- **CI-only secret** → `GH_REVIEW_PAT` (the GitHub review bot's fine-grained PAT) lives **only**
+  as an ADO **pipeline** secret variable on the `left-jab-harness-review` definition — it is
+  **never** committed and never written to disk in this repo.
 - The root [`.gitignore`](./.gitignore) enforces all of the above. When in doubt, run a secret
   scan (`gitleaks detect --no-git`) before pushing.
 
@@ -66,6 +74,7 @@ This is a **public** repository. Never commit secrets or environment-specific va
 | Rule file | Loads when you touch… | Covers |
 |-----------|----------------------|--------|
 | [`pr-bot.md`](./.claude/rules/pr-bot.md) | `src/build/pr-bot/**` | Harness vs. target repo, markers (`[no-auto]`/`[no-bot]`), four-layer OOM protection, ntfy stream resilience, router exit-code contract (incl. `exit 75` yield), self-healing, concurrency stand-down |
+| [`ci-review.md`](./.claude/rules/ci-review.md) | `claude-pr-review-pipeline.yml`, `src/build/github-pr-review.py`, `src/build/test/github-pr-review-test.sh` | CI-side Claude PR review for **GitHub** — pipeline structure, the poster's 7-step flow, ADO→GitHub API mapping (REST + GraphQL), YAML gotchas, first-Python-in-repo notes |
 
 ---
 

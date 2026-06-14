@@ -16,5 +16,9 @@ config.env
 *.swp
 *~
 
+# ── Python bytecode (github-pr-review.py + its py_compile syntax guard) ──
+__pycache__/
+*.py[cod]
+
 # ── Worktrees (Claude Code) ──
 .claude/worktrees/
