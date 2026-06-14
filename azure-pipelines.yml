@@ -1,7 +1,8 @@
 # Left Jab Harness — CI pipeline (Azure DevOps, GitHub-hosted source)
 #
 # Lints (shellcheck) and tests (self-contained bash suites) the harness, then builds the
-# runtime container image. On `main` it also pushes the image to the configured registry.
+# runtime container image. On `main` (and on a daily schedule) it also pushes the image to the
+# configured registry, tagged with a full 3-part semver.
 #
 # This pipeline is ADO-built but the source lives in a public GitHub repo, so company-
 # specific values are NOT committed here — they are supplied as PIPELINE VARIABLES on the
@@ -15,6 +16,11 @@
 #
 # Build-only on PRs; build + push on main (mirrors the house PublishArtifact pattern).
 # Native GitHub Actions are intentionally out of scope — there is no .github/workflows/.
+#
+# Build.BuildNumber is pinned to a single monotonic counter (below) so the image tag is always
+# a valid 3-part semver. The counter resets only if the pipeline is renamed.
+
+name: $[counter('left-jab-image', 1)]
 
 trigger:
   branches:
@@ -24,6 +30,17 @@ trigger:
     include:
       - src/build/**
       - azure-pipelines.yml
+
+# Daily rebuild so base-image (mcr.microsoft.com/dotnet/sdk) + apt/Node/Claude-CLI security
+# updates land without a code change. always:false => skipped when no commits since the last
+# successful scheduled run (no churn of identical images).
+schedules:
+  - cron: '17 7 * * *'
+    displayName: Daily bot image (if changed)
+    branches:
+      include:
+        - main
+    always: false
 
 pr:
   branches:
@@ -40,8 +57,9 @@ resources:
 variables:
   vmImageName: 'ubuntu-latest'
   dockerfilePath: 'src/build/pr-bot/Dockerfile'
-  # Image is tagged by commit (decision: "tagged by commit").
-  tag: '$(Build.SourceVersion)'
+  # Full-semver image tag. Build.BuildNumber is the monotonic counter pinned via `name:` above,
+  # so this renders MAJOR.MINOR.PATCH (e.g. 1.0.7). Bump 1.0 by hand for a real minor/major.
+  imageTag: '1.0.$(Build.BuildNumber)'
   ${{ if eq(variables['Build.Reason'], 'PullRequest') }}:
     dockerCommand: 'build'
   ${{ else }}:
@@ -103,6 +121,10 @@ stages:
 
           - task: Docker@2
             displayName: 'Build harness image (and push on main)'
+            # DEFERRED (spec 02-image-and-build-pipeline.md): GA wants a dedicated
+            # finistackbot.azurecr.io, an Azure-Linux multi-stage image, and digest-pin +
+            # cosign sign + SBOM. This proof reuses the existing single-stage Debian image and
+            # the shared registry (both supplied as pipeline variables).
             inputs:
               command: $(dockerCommand)
               repository: $(imageRepository)
@@ -112,5 +134,5 @@ stages:
               buildContext: '$(Build.SourcesDirectory)'
               containerRegistry: $(dockerRegistryServiceConnection)
               tags: |
-                $(tag)
+                $(imageTag)
                 latest
