@@ -44,13 +44,37 @@ ${diff_content}
 
 Respond: {\"risk\":\"low|medium|high\",\"reasoning\":\"one sentence\"}"
 
-  local result
+  # Risk classification is a lightweight task — pin it to the small/fast model when the
+  # deployment provides one. With no --model, `claude --print` inherits ANTHROPIC_MODEL
+  # (the heavy default), which some proxies reject for this alias (HTTP 400) — silently
+  # fail-closing every PR to "unknown". Omitting --model when ANTHROPIC_SMALL_FAST_MODEL
+  # is unset preserves the inherit-the-default behavior for deployments without the var.
+  local claude_args=(--print --output-format text)
+  if [ -n "${ANTHROPIC_SMALL_FAST_MODEL:-}" ]; then
+    claude_args+=(--model "$ANTHROPIC_SMALL_FAST_MODEL")
+  fi
+  claude_args+=(-p "$prompt")
+
+  local result="" claude_rc=0 claude_stderr=""
   if command -v claude >/dev/null 2>&1; then
-    result=$(timeout 120 claude --print --output-format text -p "$prompt" 2>/dev/null) || true
+    local stderr_file
+    stderr_file=$(mktemp 2>/dev/null || echo "${TMPDIR:-/tmp}/risk-classify-$$.err")
+    result=$(timeout 120 claude "${claude_args[@]}" 2>"$stderr_file") || claude_rc=$?
+    claude_stderr=$(cat "$stderr_file" 2>/dev/null) || true
+    rm -f "$stderr_file" 2>/dev/null || true
   fi
 
   if [ -z "$result" ]; then
-    # Claude unavailable — require manual approval
+    # Surface WHY before returning the unchanged "unknown" contract: a model rejection
+    # (4xx) and a genuinely-empty reply previously collapsed to the same benign line,
+    # masking config errors as transient unavailability. Log to STDERR so it reaches the
+    # journal WITHOUT polluting the JSON this function writes to stdout (the caller
+    # captures stdout as risk_json).
+    if [ "$claude_rc" -ne 0 ] || [ -n "$claude_stderr" ]; then
+      local err_snippet
+      err_snippet=$(printf '%s' "$claude_stderr" | tr '\n' ' ' | head -c 200) || true
+      log "⚠️  risk-classify: claude failed (rc=${claude_rc}): ${err_snippet}" >&2
+    fi
     echo '{"risk":"unknown","reasoning":"Claude unavailable, requiring manual approval"}'
     return 0
   fi
