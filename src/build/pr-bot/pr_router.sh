@@ -273,10 +273,31 @@ fi
 
 # Verify git can authenticate to remote (catches missing credential helper in systemd/launchd)
 if ! git -C "$REPO_ROOT" ls-remote --exit-code origin HEAD >/dev/null 2>&1; then
-  log "❌ git ls-remote failed — cannot reach origin"
-  log "❌ Run: ./install-service.sh  (auto-configures HTTPS + credential helper)"
-  log "❌ Or:  source ../setup-git-credentials.sh && setup_git_credentials '$REPO_ROOT'"
-  exit 1
+  # One-shot self-heal: the monorepo origin may still be SSH while this daemon runs with
+  # no usable SSH agent (the common cause of exit 128 here). When an ADO_PAT is available,
+  # convert origin → HTTPS and wire the PAT credential helper, then retry ONCE. The
+  # converter + its credential helper are snapshotted next to this script by start.sh, so
+  # $SCRIPT_DIR resolves them even though the router runs from the ephemeral snapshot.
+  HEALED=false
+  if [ -n "${ADO_PAT:-}" ] && [ -f "$SCRIPT_DIR/setup-git-credentials.sh" ]; then
+    log "🔧 git ls-remote failed — attempting SSH→HTTPS+PAT self-heal for origin..."
+    # shellcheck source=../setup-git-credentials.sh
+    source "$SCRIPT_DIR/setup-git-credentials.sh"
+    # Capture (don't pipe) the converter's output so `set -o pipefail` can't trip on a
+    # non-zero error count, then mirror each line into the journal for visibility.
+    HEAL_OUTPUT=$(setup_git_credentials "$REPO_ROOT" 2>&1) || true
+    while IFS= read -r _hl; do [ -n "$_hl" ] && log "    $_hl"; done <<< "$HEAL_OUTPUT"
+    if git -C "$REPO_ROOT" ls-remote --exit-code origin HEAD >/dev/null 2>&1; then
+      log "✅ Self-heal succeeded — origin reachable over HTTPS+PAT"
+      HEALED=true
+    fi
+  fi
+  if [ "$HEALED" != true ]; then
+    log "❌ git ls-remote failed — cannot reach origin"
+    log "❌ Run: ./install-service.sh  (auto-configures HTTPS + credential helper)"
+    log "❌ Or:  source '$SCRIPT_DIR/setup-git-credentials.sh' && setup_git_credentials '$REPO_ROOT'"
+    exit 1
+  fi
 fi
 PR_LOCK_DIR="$STATE_DIR/pr-${PR_ID}.lock"
 # A fresh lock dir whose PID line is still empty is a router mid-acquisition, NOT a
@@ -1259,6 +1280,18 @@ Do NOT re-read files you already read. Do NOT redo work already done. Be efficie
     elif [ "$CLAUDE_EXIT_CODE" -ne 0 ]; then
       log "⚠️  Claude Code exited with code $CLAUDE_EXIT_CODE"
       log "⚠️  Stdout (last 2000 chars): $(tail -c 2000 "$CLAUDE_STDOUT_FILE" 2>/dev/null)"
+      # Surface stderr too — a non-zero exit with empty stdout (the common
+      # config-error shape) previously logged nothing actionable, so a permanent
+      # model/auth misconfig looked identical to a transient blip.
+      CLAUDE_STDERR_TAIL=$(tail -c 2000 "$CLAUDE_STDERR_FILE" 2>/dev/null)
+      [ -n "$CLAUDE_STDERR_TAIL" ] && log "⚠️  Stderr (last 2000 chars): $CLAUDE_STDERR_TAIL"
+      # Flag config-level (non-transient) rejections distinctly: a bad ANTHROPIC_MODEL
+      # alias or a revoked token will NOT fix itself on retry, so it must not hide behind
+      # the generic "exited with code N". Match the proxy's model-rejection wording and
+      # the HTTP 4xx auth/authorization codes.
+      if printf '%s' "$CLAUDE_STDERR_TAIL" | grep -qiE 'model is not available|not_found_error|authentication_error|permission_error|x-api-key|invalid[ _-]?api[ _-]?key|HTTP (400|401|403)|"?status"?:? ?(400|401|403)'; then
+        log "🛑 Claude failure looks CONFIG-LEVEL (model/auth rejection), not transient — check ANTHROPIC_MODEL / ANTHROPIC_AUTH_TOKEN in .secrets.env (a retry will not fix this)"
+      fi
     fi
     break
   fi

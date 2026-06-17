@@ -281,6 +281,16 @@ SNAPSHOT_DIR="$STATE_DIR/script-snapshot"
 rm -rf "$SNAPSHOT_DIR"
 mkdir -p "$SNAPSHOT_DIR"
 cp "$SCRIPT_DIR"/*.sh "$SNAPSHOT_DIR/"
+# Snapshot the git-credential sibling files (they live in the build dir one level up,
+# NOT in pr-bot/, so the *.sh glob above misses them). pr_router.sh's git-auth guard
+# sources $SCRIPT_DIR/setup-git-credentials.sh at runtime to self-heal an SSH→HTTPS+PAT
+# remote; setup_git_credentials resolves git-credential-ado-pat as its own sibling
+# (via BASH_SOURCE), so BOTH must land together in the snapshot. Best-effort: a
+# deployment without these files simply won't self-heal (the guard still hard-fails loudly).
+for cred_file in setup-git-credentials.sh git-credential-ado-pat; do
+  [ -f "$SCRIPT_DIR/../$cred_file" ] && cp "$SCRIPT_DIR/../$cred_file" "$SNAPSHOT_DIR/"
+done
+[ -f "$SNAPSHOT_DIR/git-credential-ado-pat" ] && chmod +x "$SNAPSHOT_DIR/git-credential-ado-pat"
 # Snapshot shared scripts (sibling dir referenced by ../shared/ from SCRIPT_DIR)
 if [ -d "$SCRIPT_DIR/../shared" ]; then
   mkdir -p "$SNAPSHOT_DIR/../shared"
