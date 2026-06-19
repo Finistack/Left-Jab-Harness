@@ -978,12 +978,45 @@ fi
 # But first: requeue stale/queued build policies and run the policy gate (approve/auto-complete)
 if [ "$HAS_UNRESOLVED_COMMENTS" = false ] && [ "$HAS_FAILING_BUILD" = false ] && [ "$HAS_MERGE_CONFLICT" = false ]; then
   # Requeue stale build policies (queued but never refreshed after a push)
-  # Don't run full policy gate here — no worktree exists, so risk classification
-  # would diff against main (wrong context). Full gate runs after Claude processes.
   if [ -n "${POLICY_EVALS:-}" ]; then
     requeue_expired_policies "$PR_ID" "$PROJECT_ID" "$POLICY_EVALS" || true
   fi
-  log "✅ No unresolved comments and all policies passing — nothing to do"
+  # A born-clean PR (green + resolved + conflict-free, created already passing with no
+  # review comments) never reaches the Claude path below, so it never hit the
+  # run_policy_gate at the tail — it sat unmerged forever (no merge vote / no
+  # auto-complete) while the heartbeat re-dispatched it every cycle to this same
+  # exit 0 (the #1571 merge-starvation). Run the merge-only gate HERE.
+  #   * [no-auto] still suppresses it (auto_*_pr honor skip_auto → human merges).
+  #   * Already-armed PRs are left for ADO to merge (re-running would re-post the
+  #     risk comment each webhook); the heartbeat's `armed` gate already skips them.
+  #   * classify_pr_risk needs the PR branch as HEAD or it diffs the bot checkout's
+  #     stale branch and could mis-rate a high-risk PR as low (fail-OPEN). A throwaway
+  #     detached worktree on the fetched branch tip gives it origin/main...HEAD honestly;
+  #     cleanup() tears down $WORK_DIR on exit.
+  ALREADY_ARMED=$(echo "${PR_DETAILS:-}" | jq -r '.autoCompleteSetBy.id // empty' 2>/dev/null) || true
+  if [ "${SKIP_AUTO:-0}" = "1" ]; then
+    log "⏸️  [no-auto] — skipping merge-only policy gate (human approves & completes)"
+  elif [ -n "$ALREADY_ARMED" ]; then
+    log "✅ Auto-complete already armed — ADO will merge when builds pass; skipping gate"
+  elif [ -z "${SOURCE_BRANCH:-}" ]; then
+    log "⚠️  No source branch resolved — cannot stage risk worktree; skipping merge-only gate"
+  else
+    WORK_DIR="$WORKTREE_DIR/pr-${PR_ID}-$$"
+    if [ -d "$WORK_DIR" ]; then
+      git -C "$REPO_ROOT" worktree remove --force "$WORK_DIR" 2>/dev/null || true
+      rm -rf "$WORK_DIR"
+      git -C "$REPO_ROOT" worktree prune 2>/dev/null || true
+    fi
+    git -C "$REPO_ROOT" -c gc.auto=0 fetch origin main "$SOURCE_BRANCH" 2>/dev/null || true
+    if git -C "$REPO_ROOT" worktree add --detach "$WORK_DIR" "origin/$SOURCE_BRANCH" 2>/dev/null; then
+      log "🔓 PR #${PR_ID} is green + resolved + conflict-free but unmerged — running merge-only policy gate"
+      run_policy_gate "$PR_ID" "$REPO_ID" "$PROJECT_ID" "$WORK_DIR" "${SKIP_AUTO:-0}" || true
+    else
+      log "⚠️  Could not stage worktree for merge-only gate (origin/$SOURCE_BRANCH) — leaving for the next cycle"
+      WORK_DIR=""
+    fi
+  fi
+  log "✅ No unresolved comments and all policies passing — nothing else to do"
   exit 0
 fi
 
@@ -1333,9 +1366,30 @@ elif jq -e '.type == "result"' "$CLAUDE_STDOUT_FILE" >/dev/null 2>&1; then
   TERMINAL_REASON=$(jq -r '.terminal_reason // ""' "$CLAUDE_STDOUT_FILE" 2>/dev/null)
   log "📊 Claude result (first 500 chars): $(echo "$CLAUDE_RESULT" | head -c 500)"
 
+  # Guard against a FALSE success from an API-error envelope. When the model alias is
+  # rejected (4xx) or auth fails, the CLI still emits a normal {"type":"result"} whose
+  # .result STARTS with "API Error:" and which did ZERO inference (output_tokens==0).
+  # Claude made no commits, so the push-verification below sees local HEAD == remote
+  # HEAD (nothing diverged) and would set CLAUDE_SUCCESS=true — running the policy gate
+  # on an unprocessed PR and hiding a permanent misconfig from the circuit breaker (it
+  # never saw a failure to back off on). Classify it as a hard failure instead.
+  CLAUDE_API_ERROR=false
+  _out_tokens=$(jq -r '.usage.output_tokens // 0' "$CLAUDE_STDOUT_FILE" 2>/dev/null || echo 0)
+  _is_error=$(jq -r '.is_error // false' "$CLAUDE_STDOUT_FILE" 2>/dev/null || echo false)
+  if [ "$_is_error" = "true" ] || { printf '%s' "$CLAUDE_RESULT" | head -c 32 | grep -qiE '^API Error:' && [ "$_out_tokens" = "0" ]; }; then
+    CLAUDE_API_ERROR=true
+    log "🛑 Claude returned an API-error envelope (no inference: output_tokens=${_out_tokens}) — treating as FAILURE, not a silent no-op success"
+    log "🛑 $(printf '%s' "$CLAUDE_RESULT" | head -c 240)"
+    if printf '%s' "$CLAUDE_RESULT" | grep -qiE 'model is not available|not supported|not_found_error|model_group|authentication_error|permission_error|invalid[ _-]?api[ _-]?key|HTTP (400|401|403)'; then
+      log "🛑 Looks CONFIG-LEVEL (model/auth) — check ANTHROPIC_MODEL / ANTHROPIC_AUTH_TOKEN in .secrets.env (a retry will NOT fix this)"
+    fi
+  fi
+
   # WU1: Git-based push verification — check if commits were actually pushed
   # 1. Check for uncommitted changes in the worktree
-  if [ -d "${WORK_DIR:-}" ]; then
+  if [ "$CLAUDE_API_ERROR" = true ]; then
+    log "⏭️  Skipping push-verification — an API-error envelope is a failure, not a no-op success"
+  elif [ -d "${WORK_DIR:-}" ]; then
     UNCOMMITTED_CHANGES=$(git -C "$WORK_DIR" status --porcelain 2>/dev/null | head -5)
     if [ -n "$UNCOMMITTED_CHANGES" ]; then
       log "⚠️  Uncommitted changes detected in worktree:"
