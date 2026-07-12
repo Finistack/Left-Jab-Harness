@@ -718,6 +718,43 @@ get_cgroup_mem_mb() {
   awk '{printf "%d", $1/1024/1024}' "$cur" 2>/dev/null
 }
 
+# Unreclaimable cgroup memory (MB) — the figure that ACTUALLY constrains us. THE
+# WEDGE THIS FIXES: memory.current also counts reclaimable page cache + slab
+# (inactive_file, slab_reclaimable) that the kernel drops before it ever OOM-kills.
+# With MemoryHigh unset (=max) that cache accretes above the admission budget and
+# is never proactively reclaimed, so trusting memory.current makes
+# check_resource_budget defer EVERY dispatch on cache the OOM killer would reclaim
+# for free (observed: 1.4 GB "used" with ~7 MB anon RSS → 4-day silent wedge).
+# We subtract the reclaimable pools so admission/aggregate guards gate on memory
+# that a reclaim/OOM pass canNOT free (anon + kernel_stack + pagetables + unevictable
+# + slab_unreclaimable + shmem). Returns empty on non-Linux / cgroup-v1 (callers fall back).
+# Optional args (for tests): $1=memory.current path, $2=memory.stat path.
+get_cgroup_unreclaimable_mb() {
+  local rel cur stat
+  if [ -n "${1:-}" ] && [ -n "${2:-}" ]; then
+    cur="$1"; stat="$2"
+  else
+    rel=$(awk -F: '$1=="0"{print $3}' /proc/self/cgroup 2>/dev/null)
+    [ -z "$rel" ] && return 1
+    cur="/sys/fs/cgroup${rel}/memory.current"
+    stat="/sys/fs/cgroup${rel}/memory.stat"
+  fi
+  [ -r "$cur" ] && [ -r "$stat" ] || return 1
+  local current reclaimable
+  current=$(cat "$cur" 2>/dev/null)
+  [[ "$current" =~ ^[0-9]+$ ]] || return 1
+  # Reclaimable = the pools a reclaim/OOM pass frees before killing anything.
+  reclaimable=$(awk '
+    $1=="inactive_file"    {r += $2}
+    $1=="slab_reclaimable" {r += $2}
+    END {printf "%d", r}
+  ' "$stat" 2>/dev/null)
+  [[ "$reclaimable" =~ ^[0-9]+$ ]] || reclaimable=0
+  local unreclaimable=$(( current - reclaimable ))
+  [ "$unreclaimable" -lt 0 ] && unreclaimable=0
+  awk -v b="$unreclaimable" 'BEGIN{printf "%d", b/1024/1024}'
+}
+
 # Terminate a handler and its ENTIRE descendant subtree. A plain `kill $pid` on
 # the tracked subshell-bash does NOT propagate to the timeout→claude→node/MCP
 # children — they are reparented to init and KEEP consuming cgroup memory, so a
@@ -746,9 +783,12 @@ get_total_child_rss_mb() {
     total=$((total + ${sub:-0}))
   done
   # Prefer the cgroup truth when it is higher (captures overhead the subtree walk
-  # cannot attribute to a tracked PID, e.g. heartbeat/ntfy/git helpers).
+  # cannot attribute to a tracked PID, e.g. heartbeat/ntfy/git helpers). Use the
+  # UNRECLAIMABLE figure, not raw memory.current: reclaimable page cache/slab is
+  # freed before any OOM kill, so counting it against the admission budget is wrong
+  # accounting and silently wedges dispatch (see get_cgroup_unreclaimable_mb).
   local cg
-  cg=$(get_cgroup_mem_mb 2>/dev/null) || cg=""
+  cg=$(get_cgroup_unreclaimable_mb 2>/dev/null) || cg=""
   if [[ "$cg" =~ ^[0-9]+$ ]] && [ "$cg" -gt "$total" ]; then
     total="$cg"
   fi
@@ -871,18 +911,21 @@ kill_oversized_claudes() {
   # Pass 2 — AGGREGATE guard (the OOM stop the per-process check misses): two
   # sessions can each be UNDER their own 150% limit yet collectively breach the
   # 3G cgroup cap, which (KillMode=control-group) OOM-kills the entire bot. We
-  # trigger on the AUTHORITATIVE cgroup memory.current (the exact number systemd
-  # OOM-compares) when available, falling back to the subtree-sum, and shed load
-  # PRE-emptively by killing the YOUNGEST live handler's whole subtree (least work
-  # invested; its lease is left active so a later heartbeat re-dispatches it once
-  # there is headroom). Repeat until under the mark or only one handler remains
-  # (never starve the bot to zero).
+  # trigger on the cgroup's UNRECLAIMABLE memory (memory.current minus reclaimable
+  # cache/slab — the memory an OOM pass canNOT free) when available, falling back
+  # to the subtree-sum, and shed load PRE-emptively by killing the YOUNGEST live
+  # handler's whole subtree (least work invested; its lease is left active so a
+  # later heartbeat re-dispatches it once there is headroom). Repeat until under
+  # the mark or only one handler remains (never starve the bot to zero).
+  # NOTE: we deliberately do NOT trigger on raw memory.current — reclaimable page
+  # cache accreting under MemoryHigh=max would otherwise shed healthy handlers for
+  # memory the kernel frees for free (the page-cache wedge, issue #8).
   local highwater_mb=$(( (MEMORY_BUDGET_MB * 90) / 100 ))  # 90% of admission budget
   local guard_iters=0
   while [ "$guard_iters" -lt 8 ]; do
     guard_iters=$((guard_iters + 1))
     local total_mb cg_mb
-    cg_mb=$(get_cgroup_mem_mb 2>/dev/null) || cg_mb=""
+    cg_mb=$(get_cgroup_unreclaimable_mb 2>/dev/null) || cg_mb=""
     if [[ "$cg_mb" =~ ^[0-9]+$ ]]; then
       total_mb="$cg_mb"
     else
