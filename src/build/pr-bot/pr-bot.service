@@ -18,6 +18,15 @@ SyslogIdentifier=pr-bot
 
 # Resource limits
 LimitNOFILE=4096
+# Soft high-water mark (below MemoryMax). The kernel reclaims/throttles this
+# cgroup as it approaches MemoryHigh, so reclaimable page cache + slab can NEVER
+# accrete unbounded above the admission budget — the mechanism behind the
+# page-cache wedge (a 1.4 GB "used" cgroup with ~7 MB real RSS silently deferred
+# every dispatch for days). Set ABOVE the admission worst case (MEMORY_BUDGET_MB
+# 2700 − RESERVED 300 + 2 MEDIUM sessions ≈ 2500 MB working set) and BELOW
+# MemoryMax, so throttling bites the cache, not live handlers. Defense-in-depth
+# for the start.sh unreclaimable-accounting fix.
+MemoryHigh=2560M
 # Hard memory wall. KillMode=control-group means exceeding this OOM-kills the
 # WHOLE bot (all in-flight routers), so the app-level admission budget
 # (MEMORY_BUDGET_MB in config.env/start.sh) is set ~370MB UNDER this to defer or
