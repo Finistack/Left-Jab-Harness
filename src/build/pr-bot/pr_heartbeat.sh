@@ -298,7 +298,19 @@ while true; do
       continue  # already queued for this PR — don't accrue duplicates
     fi
     local_payload=$(build_synthetic_payload "$pr_json")
-    echo "$local_payload" > "$local_defer_file"
+    # GUARD: this write is the heartbeat's only side effect, and it runs under
+    # `set -euo pipefail` (line 2). An unguarded failure here does NOT skip one
+    # PR — it exits the whole script, killing the `while true` recovery loop for
+    # the daemon's remaining lifetime. Observed live 2026-09-29: the state volume
+    # filled, this write returned ENOSPC, and orphan-PR recovery stayed dead for
+    # 8h with the systemd unit still reporting `active`. A single un-writable
+    # queue entry must never cost us the loop: log it, drop the partial file
+    # (a truncated payload would be drained as a malformed event), and move on.
+    if ! echo "$local_payload" > "$local_defer_file" 2>/dev/null; then
+      log "⚠️  Could not queue PR #${local_pr_id} (write failed — disk full?) — skipping"
+      rm -f "$local_defer_file" 2>/dev/null || true
+      continue
+    fi
     recovered=$((recovered + 1))
   done < <(echo "$local_prs" | jq -c '.value[]' 2>/dev/null)
 
