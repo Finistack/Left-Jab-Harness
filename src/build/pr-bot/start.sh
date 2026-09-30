@@ -1406,6 +1406,24 @@ replay_queued_messages
 HEARTBEAT_PID=$!
 echo "[$(date '+%H:%M:%S')] 🫀 Heartbeat started (PID: $HEARTBEAT_PID, interval: ${HEARTBEAT_INTERVAL_SECS:-300}s)"
 
+# Supervise the heartbeat. Its failure is otherwise SILENT and PERMANENT: nothing
+# else in the daemon notices it is gone, the systemd unit stays `active`
+# (WatchdogSec covers the main process, which keeps pinging), and orphan-PR
+# recovery — the only path that re-dispatches work dropped by a missed webhook
+# or an OOM-killed router — stops for the daemon's whole lifetime. Observed live
+# 2026-09-29: a transient ENOSPC in pr_heartbeat.sh killed it, and it stayed dead
+# 8h until a human noticed the PR queue had gone quiet. Respawning from the 60s
+# maintenance tick makes any exit self-heal instead of degrading in silence.
+ensure_heartbeat_alive() {
+  if kill -0 "$HEARTBEAT_PID" 2>/dev/null; then
+    return 0
+  fi
+  echo "[$(date '+%H:%M:%S')] 🫀 Heartbeat (PID: $HEARTBEAT_PID) is gone — respawning"
+  "$RUNTIME_SCRIPT_DIR/pr_heartbeat.sh" &
+  HEARTBEAT_PID=$!
+  echo "[$(date '+%H:%M:%S')] 🫀 Heartbeat restarted (PID: $HEARTBEAT_PID, interval: ${HEARTBEAT_INTERVAL_SECS:-300}s)"
+}
+
 # Update cleanup to also kill heartbeat (redefines the earlier function)
 cleanup() {
   echo ""
@@ -1465,6 +1483,9 @@ while true; do
       # tick bypasses the LAST_REAP_TS throttle (it's already rate-limited to 60s).
       reap_orphaned_subprocesses || true
       LAST_REAP_TS=$_now
+      # Respawn the heartbeat if it died (transient write failure, OOM, …) —
+      # without this, orphan-PR recovery degrades silently and permanently.
+      ensure_heartbeat_alive || true
       drain_deferred_queue || true
       kill_oversized_claudes || true
     fi
