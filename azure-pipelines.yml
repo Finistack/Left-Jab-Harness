@@ -152,6 +152,9 @@ stages:
           - task: AzureCLI@2
             displayName: 'Push harness image with ACR scoped authentication'
             condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+            # The registry occasionally refuses a layer upload mid-push (transient TLS/TCP),
+            # which fails the whole job. Retry the task a bounded number of times.
+            retryCountOnTaskFailure: 3
             inputs:
               azureSubscription: 'WIF_Finistack'
               scriptType: bash
