@@ -10,13 +10,13 @@
 # never baked in. See .dockerignore for the secret/state exclusions.
 
 # .NET SDK 10 (Debian bookworm: ships bash 5 + git; start.sh requires bash 4.3+).
-FROM mcr.microsoft.com/dotnet/sdk:10.0
+FROM mcr.microsoft.com/dotnet/sdk:11.0
 
 # Node major used to install the Claude Code CLI. The NodeSource apt repo URL below
 # requires a bare major, so the pin stays major-only and Renovate tracks it with
 # versioning=node.
 # renovate: datasource=node-version depName=node versioning=node
-ARG NODE_MAJOR=20
+ARG NODE_MAJOR=24
 # Claude Code CLI version, pinned so the image is reproducible and the version is
 # recorded in the SBOM. Renovate proposes bumps from the npm registry.
 # renovate: datasource=npm depName=@anthropic-ai/claude-code
