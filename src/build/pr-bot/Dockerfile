@@ -28,7 +28,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 # OS packages: curl/jq/git/ca-certificates + Node (for the Claude CLI). The apt upgrade
 # patches base-image CVEs. NodeSource provides a current
-# Node major (Debian's default is older than the CLI supports).
+# Node major (Debian's default is older than the CLI supports). The Node major and the
+# Claude CLI version are both Renovate-managed (see the annotations above).
 RUN set -eux; \
     apt-get update && apt-get upgrade -y; \
     apt-get install -y --no-install-recommends \
