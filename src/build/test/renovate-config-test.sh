@@ -20,6 +20,21 @@ RENOVATE_JSON="$REPO_ROOT/renovate.json"
 [ -f "$DOCKERFILE" ] || { echo "FAIL: missing $DOCKERFILE"; exit 1; }
 [ -f "$RENOVATE_JSON" ] || { echo "FAIL: missing $RENOVATE_JSON"; exit 1; }
 
+WORKFLOW="$REPO_ROOT/.github/workflows/renovate.yml"
+[ -f "$WORKFLOW" ] || { echo "FAIL: missing $WORKFLOW"; exit 1; }
+
+# Guard against loading renovate.json twice. Renovate auto-discovers the repo-root
+# renovate.json; if the workflow ALSO passes the action's configurationFile input (which
+# sets RENOVATE_CONFIG_FILE), the config is merged twice, duplicating the customManager.
+# That yields duplicate dependency extractions and duplicate Renovate PRs. See
+# https://github.com/renovatebot/github-action (configurationFile input).
+if grep -Eq '^[[:space:]]*configurationFile:' "$WORKFLOW"; then
+  echo "FAIL: $WORKFLOW sets configurationFile; Renovate already auto-discovers renovate.json"
+  echo "      (double-loading duplicates customManagers and creates duplicate PRs)"
+  exit 1
+fi
+echo "PASS: Renovate loads renovate.json once (no configurationFile override)"
+
 python3 - "$DOCKERFILE" "$RENOVATE_JSON" <<'PY'
 import json
 import re

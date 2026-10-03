@@ -37,7 +37,9 @@ jobs:
       - name: Run Renovate
         uses: renovatebot/github-action@v46.3.6
         with:
-          configurationFile: renovate.json
+          # Do NOT pass configurationFile here: Renovate auto-discovers renovate.json at the
+          # repo root, and mounting it as well loads it twice, which duplicates the
+          # customManager and yields duplicate dependency extractions (and duplicate PRs).
           token: ${{ secrets.GITHUB_TOKEN }}
         env:
           RENOVATE_REPOSITORIES: ${{ github.repository }}
