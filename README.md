@@ -23,6 +23,21 @@ PR events and drives the ADO REST API. The harness runs from its own checkout an
   PRs and posts findings back (inline comments, thread resolution, and a real `APPROVE` when
   clean) via the GitHub REST + GraphQL APIs.
 
+## Dependency updates (Renovate)
+
+The runtime image's build-time toolchain is pinned in `src/build/pr-bot/Dockerfile`:
+
+- the `dotnet/sdk` base image (the built-in `dockerfile` manager reads the `FROM` line),
+- `NODE_MAJOR` (the NodeSource apt repo requires a bare major; tracked with `versioning=node`),
+- `CLAUDE_CODE_VERSION` (the Claude Code CLI, pinned so the version is recorded in the SBOM).
+
+A weekly GitHub Actions workflow (`.github/workflows/renovate.yml`) runs
+[Renovate](https://docs.renovatebot.com/) against `renovate.json` to propose bumps. Non-major
+toolchain bumps are grouped into one PR so the image rebuilds once; major bumps get their own PR.
+The `# renovate:` annotations on the `ARG` lines are parsed by the `customManagers` regex, and
+`src/build/test/renovate-config-test.sh` fails if an annotation stops parsing or a toolchain arg
+floats at `latest`.
+
 ## Quick start
 
 ```bash
