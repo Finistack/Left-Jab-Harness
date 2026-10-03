@@ -5,9 +5,12 @@
 # the monorepo's self-hosted Renovate only manages the *image tag* it consumes, not the
 # dependencies baked into the image built here.
 #
-# Runs with the workflow's automatic GITHUB_TOKEN (contents + pull-requests write); no
-# repository secret is required for this public repo. A GitHub App or PAT (RENOVATE_TOKEN)
-# is only needed later if Renovate must trigger further workflows on its own PRs.
+# Runs with the workflow's automatic GITHUB_TOKEN; no repository secret is required for this
+# public repo. The token needs contents + pull-requests (branches/PRs) and issues (the
+# Dependency Dashboard). Renovate PRs authored by GITHUB_TOKEN do not re-trigger GitHub
+# Actions, but the required ADO check (left-jab-harness) fires from the GitHub webhook
+# regardless, so PRs are still gated. A GitHub App or PAT (RENOVATE_TOKEN) is only needed if
+# Renovate itself must trigger other GitHub Actions workflows.
 name: Renovate
 
 on:
@@ -18,6 +21,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  issues: write
 
 concurrency:
   group: renovate
