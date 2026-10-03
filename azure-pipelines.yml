@@ -10,12 +10,18 @@
 # environment configuration. Define these when you create the pipeline
 # (see src/build/pr-bot/docs/pipeline-setup.md):
 #
-#   dockerRegistryServiceConnection  - ADO docker-registry service connection name
 #   containerRegistry                - container registry login server (e.g. <name>.azurecr.io)
 #   imageRepository                  - image repository/name (e.g. left-jab-harness)
 #
+# Push uses the WIF_Finistack Azure Resource Manager service connection (a containerregistry-
+# scoped token via src/build/acr-scoped-login.sh), NOT a docker-registry service connection:
+# the registry has ARM audience token authentication disabled (MDC control 42781ec6), which
+# 401s the docker-registry login. See docs/pipeline-setup.md.
+#
 # Build-only on PRs; build + push on main (mirrors the house PublishArtifact pattern).
-# Native GitHub Actions are intentionally out of scope — there is no .github/workflows/.
+# This ADO pipeline stays the build/CI gate. A single GitHub Actions workflow
+# (.github/workflows/renovate.yml) exists solely to run Renovate over the image's build-time
+# toolchain pins; it does not build or publish the image.
 #
 # Build.BuildNumber is pinned to a single monotonic counter (below) so the image tag is always
 # a valid 3-part semver. The counter resets only if the pipeline is renamed.
@@ -62,10 +68,6 @@ variables:
   # Full-semver image tag. Build.BuildNumber is the monotonic counter pinned via `name:` above,
   # so this renders MAJOR.MINOR.PATCH (e.g. 1.0.7). Bump 1.0 by hand for a real minor/major.
   imageTag: '1.0.$(Build.BuildNumber)'
-  ${{ if eq(variables['Build.Reason'], 'PullRequest') }}:
-    dockerCommand: 'build'
-  ${{ else }}:
-    dockerCommand: 'buildAndPush'
 
 stages:
   - stage: Validate
