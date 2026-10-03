@@ -121,23 +121,51 @@ stages:
           - checkout: self
             fetchDepth: 1
 
+          # Build only. The ACR has "ARM audience token authentication" disabled
+          # (workload-hardening policy 42781ec6, the MDC control), so the Docker@2 task must
+          # NOT log in with the docker-registry service connection (that login is ARM-scoped
+          # and now 401s). Push happens below with an ACR-scoped token instead.
           - task: Docker@2
-            displayName: 'Build harness image (and push on main)'
+            displayName: 'Build harness image'
             # DEFERRED (spec 02-image-and-build-pipeline.md): GA wants a dedicated
             # finistackbot.azurecr.io, an Azure-Linux multi-stage image, and digest-pin +
             # cosign sign + SBOM. This proof reuses the existing single-stage Debian image and
             # the shared registry (both supplied as pipeline variables).
             inputs:
-              command: $(dockerCommand)
-              repository: $(imageRepository)
+              command: build
+              repository: $(containerRegistry)/$(imageRepository)
               dockerfile: $(dockerfilePath)
               # Build context = repo root so COPY src/build resolves and root .dockerignore
               # (secret/state exclusions) is honored.
               buildContext: '$(Build.SourcesDirectory)'
-              containerRegistry: $(dockerRegistryServiceConnection)
               # Tag with both the semver (chart-pinnable) and the commit SHA (traceability:
               # the monotonic counter alone can't map an image back to its source commit).
               tags: |
                 $(imageTag)
                 $(Build.SourceVersion)
                 latest
+
+          # Push with a containerregistry-scoped AAD token, which is unaffected by the
+          # ARM-auth policy. CI (main / schedule) only; PR builds stop after the image builds.
+          - task: AzureCLI@2
+            displayName: 'Push harness image with ACR scoped authentication'
+            condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+            inputs:
+              azureSubscription: 'WIF_Finistack'
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              useGlobalConfig: false
+              visibleAzLogin: false
+              inlineScript: |
+                set -euo pipefail
+                source src/build/acr-scoped-login.sh
+                acr_scoped_login
+                for tag in "$IMAGE_TAG" "$SOURCE_VERSION" latest; do
+                  docker push "$CONTAINER_REGISTRY/$IMAGE_REPOSITORY:$tag"
+                done
+            env:
+              CONTAINER_REGISTRY: $(containerRegistry)
+              IMAGE_REPOSITORY: $(imageRepository)
+              IMAGE_TAG: $(imageTag)
+              SOURCE_VERSION: $(Build.SourceVersion)
