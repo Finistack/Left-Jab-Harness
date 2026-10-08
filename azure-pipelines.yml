@@ -29,6 +29,7 @@
 name: $[counter('left-jab-image', 1)]
 
 trigger:
+  batch: true
   branches:
     include:
       - main
