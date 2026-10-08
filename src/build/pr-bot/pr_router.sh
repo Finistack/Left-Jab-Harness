@@ -1110,7 +1110,11 @@ IMPORTANT EFFICIENCY RULES (you have limited turns):
 - Commit all changes in one commit, not multiple commits.
 - Be concise in your reasoning — focus on code changes, not explanations.
 - Do NOT create work items or link work items — the bot handles work item management automatically.
-- Do NOT reply to or comment on PR review threads. Just make the code changes. The bot handles thread resolution automatically."
+- Do NOT reply to or comment on PR review threads. Just make the code changes. The bot handles thread resolution automatically.
+- Check each captured review thread against the changed code, current callers, and applicable contract; address every captured thread with the smallest evidence-based fix.
+- In your final summary, give a concise disposition for each captured thread. Say when you could not substantiate or complete a requested fix; do not imply it was fixed.
+- In owned files you touch, remove redundant adjacent narration and keep meaningful comments concise and focused on non-obvious reasons. Preserve directives, licenses, generated/API guidance, security invariants, and comments that explain behavior.
+- Limit architectural or code simplifications to changes that reduce a material correctness or maintenance risk; avoid unrelated or broad comment-only diffs."
 
 CAPPED_NOTE=""
 if [ "$THREADS_CAPPED" = true ]; then
