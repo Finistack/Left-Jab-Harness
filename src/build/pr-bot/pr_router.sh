@@ -206,6 +206,18 @@ if pr_text_has_directive "$(printf '%s\n%s' "$PAYLOAD_PR_TITLE" "$PAYLOAD_PR_DES
   exit 0
 fi
 
+# --- [risk-approved] explicit HIGH-risk acceptance ---
+# This is deliberately a TITLE-only, line-anchored directive: a human must type
+# `[risk-approved]` at the start of the PR title (combined tags such as
+# `[risk-approved][SPEC] ...` are accepted). It lets the policy gate approve/arm a
+# HIGH-risk PR without weakening the independent unresolved-comment and build gates.
+# UNKNOWN risk remains refused: an unavailable classifier is not a risk decision.
+RISK_OVERRIDE=0
+if pr_text_has_directive "$PAYLOAD_PR_TITLE" "risk-approved"; then
+  RISK_OVERRIDE=1
+  log "⚠️  PR #${PR_ID} tagged [risk-approved] — explicit HIGH-risk acceptance detected"
+fi
+
 # --- [no-auto] opt-out (distinct from [no-bot]; does NOT stand the bot down) ---
 # [no-auto] keeps comment-fixing, rebasing, conflict resolution and work-item
 # linkage fully active; it ONLY disables auto-approve + auto-complete in the final
@@ -650,6 +662,10 @@ if [ -z "${PAYLOAD_PR_TITLE:-}" ] && [ -z "${PAYLOAD_PR_DESC:-}" ]; then
       SKIP_AUTO=1
       log "⏸️  PR #${PR_ID} tagged [no-auto] (confirmed via PR details) — auto-approve/complete disabled"
     fi
+    if [ "${RISK_OVERRIDE:-0}" != "1" ] && pr_text_has_directive "$_nb_title" "risk-approved"; then
+      RISK_OVERRIDE=1
+      log "⚠️  PR #${PR_ID} tagged [risk-approved] (confirmed via PR details) — explicit HIGH-risk acceptance detected"
+    fi
   fi
 fi
 
@@ -1010,7 +1026,7 @@ if [ "$HAS_UNRESOLVED_COMMENTS" = false ] && [ "$HAS_FAILING_BUILD" = false ] &&
     git -C "$REPO_ROOT" -c gc.auto=0 fetch origin main "$SOURCE_BRANCH" 2>/dev/null || true
     if git -C "$REPO_ROOT" worktree add --detach "$WORK_DIR" "origin/$SOURCE_BRANCH" 2>/dev/null; then
       log "🔓 PR #${PR_ID} is green + resolved + conflict-free but unmerged — running merge-only policy gate"
-      run_policy_gate "$PR_ID" "$REPO_ID" "$PROJECT_ID" "$WORK_DIR" "${SKIP_AUTO:-0}" || true
+      run_policy_gate "$PR_ID" "$REPO_ID" "$PROJECT_ID" "$WORK_DIR" "${SKIP_AUTO:-0}" "${RISK_OVERRIDE:-0}" || true
     else
       log "⚠️  Could not stage worktree for merge-only gate (origin/$SOURCE_BRANCH) — leaving for the next cycle"
       WORK_DIR=""
@@ -1516,7 +1532,7 @@ log "💾 State updated (success: $CLAUDE_SUCCESS)"
 # Run policy gate on success (risk classify → approve → auto-complete → requeue stale policies)
 # Runs even without thread IDs — heartbeat-recovered PRs may only have stale build policies.
 if [ "$CLAUDE_SUCCESS" = true ]; then
-  run_policy_gate "$PR_ID" "$REPO_ID" "$PROJECT_ID" "${WORK_DIR:-$REPO_ROOT}" "${SKIP_AUTO:-0}" || true
+  run_policy_gate "$PR_ID" "$REPO_ID" "$PROJECT_ID" "${WORK_DIR:-$REPO_ROOT}" "${SKIP_AUTO:-0}" "${RISK_OVERRIDE:-0}" || true
 fi
 
 # Resolve threads if Claude successfully addressed them
