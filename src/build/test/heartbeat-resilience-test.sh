@@ -204,6 +204,85 @@ PROBE
 fi
 
 # ---------------------------------------------------------------------------
+# 2b. pr_heartbeat.sh — readiness honors ADO blocking policy semantics
+# ---------------------------------------------------------------------------
+echo ""
+echo "🧪 pr_heartbeat.sh blocking-build readiness"
+
+READY_FN="$(extract_fn pr_is_ready_but_unmerged "$HEARTBEAT_SH")"
+if [ -z "$READY_FN" ]; then
+  fail "Failed to extract pr_is_ready_but_unmerged from pr_heartbeat.sh"
+else
+  DEFAULT_READY_JSON='{"title":"fix(api): test","isDraft":false,"autoCompleteSetBy":null,"repository":{"project":{"id":"697a6e89-a835-4f51-8da3-4b0cc2910f9a"}}}'
+  probe_ready() {
+    local evals="$1" pr_json="${2:-$DEFAULT_READY_JSON}"
+    cat > "$TMPDIR_TEST/ready-probe.sh" <<PROBE
+#!/usr/bin/env bash
+set -euo pipefail
+log() { :; }
+BUILD_POLICY_TYPE_ID="0609b952-1397-4640-95ec-e00a01b2c241"
+ADO_PROJECT="Finistack"
+ADO_BASE="https://dev.azure.com/finistack/Finistack/_apis"
+ado_api_call() { printf '%s\n' '$evals'; }
+$READY_FN
+pr_is_ready_but_unmerged 3862 '$pr_json'
+PROBE
+    chmod +x "$TMPDIR_TEST/ready-probe.sh"
+    timeout 30 "$TMPDIR_TEST/ready-probe.sh" >/dev/null 2>&1
+  }
+
+  BLOCKING_GREEN_OPTIONAL_QUEUED='{"value":[{"status":"approved","configuration":{"isBlocking":true,"isEnabled":true,"type":{"id":"0609b952-1397-4640-95ec-e00a01b2c241"}}},{"status":"queued","configuration":{"isBlocking":false,"isEnabled":true,"type":{"id":"0609b952-1397-4640-95ec-e00a01b2c241"}}}]}'
+  if probe_ready "$BLOCKING_GREEN_OPTIONAL_QUEUED"; then
+    pass "Blocking build green + optional build queued is ready"
+  else
+    fail "Optional queued build incorrectly blocks readiness"
+  fi
+
+  BLOCKING_QUEUED='{"value":[{"status":"queued","configuration":{"isBlocking":true,"isEnabled":true,"type":{"id":"0609b952-1397-4640-95ec-e00a01b2c241"}}}]}'
+  if probe_ready "$BLOCKING_QUEUED"; then
+    fail "Queued blocking build incorrectly treated as ready"
+  else
+    pass "Queued blocking build remains not-ready"
+  fi
+
+  BLOCKING_REJECTED='{"value":[{"status":"rejected","configuration":{"isBlocking":true,"isEnabled":true,"type":{"id":"0609b952-1397-4640-95ec-e00a01b2c241"}}}]}'
+  if probe_ready "$BLOCKING_REJECTED"; then
+    fail "Rejected blocking build incorrectly treated as ready"
+  else
+    pass "Rejected blocking build remains not-ready"
+  fi
+
+  DISABLED_BLOCKING_QUEUED='{"value":[{"status":"queued","configuration":{"isBlocking":true,"isEnabled":false,"type":{"id":"0609b952-1397-4640-95ec-e00a01b2c241"}}}]}'
+  if probe_ready "$DISABLED_BLOCKING_QUEUED"; then
+    pass "Disabled build policy does not block readiness"
+  else
+    fail "Disabled build policy incorrectly blocks readiness"
+  fi
+
+  ARMED_REVIEW_QUEUED='{"value":[{"status":"approved","configuration":{"isBlocking":true,"isEnabled":true,"type":{"id":"0609b952-1397-4640-95ec-e00a01b2c241"}}},{"status":"queued","configuration":{"isBlocking":true,"isEnabled":true,"type":{"id":"fd2167ab-b0be-447a-8ec8-39368250530e"}}}]}'
+  ARMED_JSON='{"title":"fix(api): test","isDraft":false,"autoCompleteSetBy":{"id":"a5a1cfa7-6acf-6bb1-a54d-17a63a5afa1f"},"repository":{"project":{"id":"697a6e89-a835-4f51-8da3-4b0cc2910f9a"}}}'
+  if probe_ready "$ARMED_REVIEW_QUEUED" "$ARMED_JSON"; then
+    pass "Armed PR with unapproved blocking review is approval-recoverable"
+  else
+    fail "Armed PR with unapproved blocking review is permanently stranded"
+  fi
+
+  ARMED_REVIEW_APPROVED='{"value":[{"status":"approved","configuration":{"isBlocking":true,"isEnabled":true,"type":{"id":"0609b952-1397-4640-95ec-e00a01b2c241"}}},{"status":"approved","configuration":{"isBlocking":true,"isEnabled":true,"type":{"id":"fd2167ab-b0be-447a-8ec8-39368250530e"}}}]}'
+  if probe_ready "$ARMED_REVIEW_APPROVED" "$ARMED_JSON"; then
+    fail "Fully approved armed PR incorrectly re-dispatched"
+  else
+    pass "Fully approved armed PR is left for ADO to merge"
+  fi
+
+  ARMED_OPTIONAL_QUEUED='{"value":[{"status":"approved","configuration":{"isBlocking":true,"isEnabled":true,"type":{"id":"0609b952-1397-4640-95ec-e00a01b2c241"}}},{"status":"approved","configuration":{"isBlocking":true,"isEnabled":true,"type":{"id":"fd2167ab-b0be-447a-8ec8-39368250530e"}}},{"status":"queued","configuration":{"isBlocking":false,"isEnabled":true,"type":{"id":"0609b952-1397-4640-95ec-e00a01b2c241"}}}]}'
+  if probe_ready "$ARMED_OPTIONAL_QUEUED" "$ARMED_JSON"; then
+    fail "Armed PR with optional queued build incorrectly re-dispatched"
+  else
+    pass "Armed PR with only optional queued build is left alone"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 # 3. Wiring — the supervisor must actually be CALLED, not merely defined.
 # ---------------------------------------------------------------------------
 # A defined-but-uncalled ensure_heartbeat_alive reproduces the original failure
@@ -217,6 +296,59 @@ if grep -qE '^[[:space:]]+ensure_heartbeat_alive[[:space:]]' "$START_SH"; then
   pass "ensure_heartbeat_alive is called in start.sh (wired into the maintenance tick)"
 else
   fail "ensure_heartbeat_alive is defined but never called — the heartbeat would still die silently"
+fi
+
+echo ""
+echo "🧪 router approval recovery"
+ROUTER_SH="$PR_BOT_DIR/pr_router.sh"
+RECOVERY_LINE=$(grep -n 'Auto-complete is armed but a blocking review policy is unapproved' "$ROUTER_SH" | cut -d: -f1 || true)
+RUN_GATE_LINE=$(grep -n 'run_policy_gate "$PR_ID" "$REPO_ID" "$PROJECT_ID" "$WORK_DIR"' "$ROUTER_SH" | head -1 | cut -d: -f1 || true)
+if [ -n "$RECOVERY_LINE" ] && [ -n "$RUN_GATE_LINE" ] && [ "$RECOVERY_LINE" -lt "$RUN_GATE_LINE" ] && [ $((RUN_GATE_LINE - RECOVERY_LINE)) -le 4 ]; then
+  pass "Armed-but-unapproved branch falls through to run_policy_gate"
+else
+  fail "Armed-but-unapproved branch does not invoke run_policy_gate"
+fi
+
+echo ""
+echo "🧪 policy gate conversation filter"
+# Exercise the SHIPPED auto_complete_pr gate with a mocked ADO transport. This is
+# stronger than matching the jq text: it proves which threads reach the PATCH.
+POLICIES_SH="$PR_BOT_DIR/pr_policies.sh"
+ADO_BASE="https://example.invalid/_apis"
+ADO_ORG="finistack"
+log() { :; }
+ado_api_call() {
+  case "$1" in
+    *"/threads?api-version="*)
+      printf '%s\n' "$MOCK_THREADS_JSON"
+      ;;
+    *"/connectionData"*)
+      echo '{"authenticatedUser":{"id":"bot-id"}}'
+      ;;
+    *"/pullRequests/3862?api-version=7.1")
+      MOCK_PATCHED=1
+      echo '{}'
+      ;;
+    *)
+      echo '{}'
+      ;;
+  esac
+}
+# shellcheck source=../pr-bot/pr_policies.sh
+source "$POLICIES_SH"
+MOCK_THREADS_JSON='{"value":[{"status":null,"properties":{"CodeReviewThreadType":{"$value":"PolicyStatusUpdate"}},"comments":[{"commentType":"system"}]},{"status":null,"properties":{"CodeReviewThreadType":{"$value":"RefUpdate"}},"comments":[{"commentType":"system"}]},{"status":"closed","properties":null,"comments":[{"commentType":"text"}]},{"status":null,"properties":null,"comments":[{"commentType":"text","content":"Please fix this"}]}]}'
+MOCK_PATCHED=0
+if auto_complete_pr 3862 repo medium >/dev/null 2>&1; then
+  fail "Open review conversation did not block auto-complete"
+else
+  [ "$MOCK_PATCHED" = 0 ]     && pass "Open review conversation blocks auto-complete"     || fail "Auto-complete PATCH sent despite an open review conversation"
+fi
+MOCK_THREADS_JSON='{"value":[{"status":null,"properties":{"CodeReviewThreadType":{"$value":"PolicyStatusUpdate"}},"comments":[{"commentType":"system"}]},{"status":null,"properties":{"CodeReviewThreadType":{"$value":"RefUpdate"}},"comments":[{"commentType":"system"}]},{"status":null,"properties":{"CodeReviewThreadType":{"$value":"ReviewersUpdate"}},"comments":[{"commentType":"system"}]},{"status":"closed","properties":null,"comments":[{"commentType":"text"}]}]}'
+MOCK_PATCHED=0
+if auto_complete_pr 3862 repo medium >/dev/null 2>&1; then
+  [ "$MOCK_PATCHED" = 1 ]     && pass "System-only threads do not block auto-complete"     || fail "Auto-complete returned success without sending the PATCH"
+else
+  fail "System-only threads incorrectly blocked auto-complete"
 fi
 
 echo ""

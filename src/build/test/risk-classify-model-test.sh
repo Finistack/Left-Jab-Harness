@@ -11,6 +11,8 @@ set -euo pipefail
 #   * On a claude failure it MUST emit a loud diagnostic on STDERR (so the journal shows
 #     WHY) while keeping STDOUT a clean unknown-risk JSON (the caller captures stdout as
 #     risk_json — a leaked log line there would corrupt the parse).
+#   * It retries exactly once before failing closed, and a transient first-attempt
+#     timeout must not poison the second attempt (the observed 120s classifier timeout).
 #
 # We source the REAL shipped pr_policies.sh (a pure function library, no top-level side
 # effects) and drive classify_pr_risk with a mocked claude/timeout, mirroring the
@@ -45,7 +47,8 @@ command() {
 source "$POLICIES"
 
 ARGS_FILE="$(mktemp)"
-trap 'rm -f "$ARGS_FILE"' EXIT
+COUNT_FILE="$(mktemp)"
+trap 'rm -f "$ARGS_FILE" "$COUNT_FILE"' EXIT
 
 # --- 1. small/fast model SET → real risk returned, --model passed through ---
 claude() { printf '%s\n' "$*" > "$ARGS_FILE"; echo '{"risk":"low","reasoning":"docs only"}'; }
@@ -71,8 +74,9 @@ else
   pass "model unset → --model omitted (no hardcoded alias)"
 fi
 
-# --- 3. claude FAILS → loud line on STDERR, clean unknown JSON on STDOUT ---
-claude() { echo "API Error: 400 model is not available" >&2; return 1; }
+# --- 3. claude FAILS BOTH ATTEMPTS → loud line on STDERR, clean unknown JSON on STDOUT ---
+echo 0 > "$COUNT_FILE"
+claude() { local n; n=$(( $(cat "$COUNT_FILE") + 1 )); echo "$n" > "$COUNT_FILE"; echo "API Error: 400 model is not available" >&2; return 1; }
 export ANTHROPIC_SMALL_FAST_MODEL="bogus-alias"
 err_file="$(mktemp)"
 out="$(classify_pr_risk 1 repo "" 2>"$err_file")"
@@ -91,6 +95,26 @@ if echo "$out" | grep -q "risk-classify"; then
 else
   pass "loud line kept OFF stdout (risk_json stays parseable)"
 fi
+
+# --- 4. first attempt times out, second succeeds → real risk returned ---
+echo 0 > "$COUNT_FILE"
+claude() {
+  local n; n=$(( $(cat "$COUNT_FILE") + 1 )); echo "$n" > "$COUNT_FILE"
+  if [ "$n" -eq 1 ]; then return 124; fi
+  echo '{"risk":"medium","reasoning":"retry succeeded"}'
+}
+err_file="$(mktemp)"
+out="$(classify_pr_risk 1 repo "" 2>"$err_file")"
+err="$(cat "$err_file")"; rm -f "$err_file"
+echo "$out" | jq -e '.risk == "medium"' >/dev/null 2>&1 \
+  && pass "transient timeout → second attempt returns real risk" \
+  || fail "retry did not recover risk: $out"
+[ "$(cat "$COUNT_FILE")" = "2" ] \
+  && pass "classifier retried exactly once" \
+  || fail "unexpected attempt count: $(cat "$COUNT_FILE")"
+echo "$err" | grep -q "attempt 1 unavailable" \
+  && pass "retry diagnostic emitted on stderr" \
+  || fail "retry diagnostic missing: $err"
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

@@ -1003,16 +1003,23 @@ if [ "$HAS_UNRESOLVED_COMMENTS" = false ] && [ "$HAS_FAILING_BUILD" = false ] &&
   # auto-complete) while the heartbeat re-dispatched it every cycle to this same
   # exit 0 (the #1571 merge-starvation). Run the merge-only gate HERE.
   #   * [no-auto] still suppresses it (auto_*_pr honor skip_auto → human merges).
-  #   * Already-armed PRs are left for ADO to merge (re-running would re-post the
-  #     risk comment each webhook); the heartbeat's `armed` gate already skips them.
+  #   * Already-armed PRs are normally left for ADO to merge (re-running would re-post
+  #     the risk comment each webhook). EXCEPTION: if a blocking non-build policy is
+  #     still unapproved, auto-complete is armed but ADO cannot merge. Run the policy
+  #     gate once to cast the merge vote; once approved, later cycles skip normally.
   #   * classify_pr_risk needs the PR branch as HEAD or it diffs the bot checkout's
   #     stale branch and could mis-rate a high-risk PR as low (fail-OPEN). A throwaway
   #     detached worktree on the fetched branch tip gives it origin/main...HEAD honestly;
   #     cleanup() tears down $WORK_DIR on exit.
   ALREADY_ARMED=$(echo "${PR_DETAILS:-}" | jq -r '.autoCompleteSetBy.id // empty' 2>/dev/null) || true
+  APPROVAL_RECOVERY_REQUIRED=false
+  if [ -n "$ALREADY_ARMED" ] && [ -n "${POLICY_EVALS:-}" ]; then
+    _review_pending=$(echo "$POLICY_EVALS" | jq -r --arg bpt "$BUILD_POLICY_TYPE_ID" '[.value[]? | select(.configuration.isBlocking == true and .configuration.isEnabled == true and .configuration.type.id != $bpt and .status != "approved")] | length' 2>/dev/null || echo "0")
+    [ "${_review_pending:-0}" -gt 0 ] && APPROVAL_RECOVERY_REQUIRED=true
+  fi
   if [ "${SKIP_AUTO:-0}" = "1" ]; then
     log "⏸️  [no-auto] — skipping merge-only policy gate (human approves & completes)"
-  elif [ -n "$ALREADY_ARMED" ]; then
+  elif [ -n "$ALREADY_ARMED" ] && [ "$APPROVAL_RECOVERY_REQUIRED" = false ]; then
     log "✅ Auto-complete already armed — ADO will merge when builds pass; skipping gate"
   elif [ -z "${SOURCE_BRANCH:-}" ]; then
     log "⚠️  No source branch resolved — cannot stage risk worktree; skipping merge-only gate"
@@ -1025,7 +1032,11 @@ if [ "$HAS_UNRESOLVED_COMMENTS" = false ] && [ "$HAS_FAILING_BUILD" = false ] &&
     fi
     git -C "$REPO_ROOT" -c gc.auto=0 fetch origin main "$SOURCE_BRANCH" 2>/dev/null || true
     if git -C "$REPO_ROOT" worktree add --detach "$WORK_DIR" "origin/$SOURCE_BRANCH" 2>/dev/null; then
-      log "🔓 PR #${PR_ID} is green + resolved + conflict-free but unmerged — running merge-only policy gate"
+      if [ -n "$ALREADY_ARMED" ]; then
+        log "🔐 Auto-complete is armed but a blocking review policy is unapproved — recovering approval"
+      else
+        log "🔓 PR #${PR_ID} is green + resolved + conflict-free but unmerged — running merge-only policy gate"
+      fi
       run_policy_gate "$PR_ID" "$REPO_ID" "$PROJECT_ID" "$WORK_DIR" "${SKIP_AUTO:-0}" "${RISK_OVERRIDE:-0}" || true
     else
       log "⚠️  Could not stage worktree for merge-only gate (origin/$SOURCE_BRANCH) — leaving for the next cycle"

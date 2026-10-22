@@ -133,7 +133,9 @@ pr_is_ready_but_unmerged() {
   #   no-auto → bot fixes/rebases but never casts the merge vote, so green+resolved+
   #             unmerged is its NORMAL terminal state; re-dispatch would loop forever.
   #   draft   → intentionally not-ready; never push it toward merge.
-  #   armed   → auto-complete already set; ADO merges on its own, nothing to recover.
+  #   armed   → normally ADO merges on its own, BUT an armed PR can still be stuck
+  #             because the merge vote was never cast. Gate 4 below distinguishes that
+  #             approval-recovery state from a genuinely complete armed PR.
   # jq-failure backstop: if jq itself fails (bad binary, OOM, malformed $pr_json),
   # ready_signal falls back to "" and Gates 1–3 are bypassed together. This is NOT a
   # regression — the previous four-fork version failed the same way on the same bad
@@ -149,13 +151,14 @@ pr_is_ready_but_unmerged() {
     else "ready"
     end' 2>/dev/null) || ready_signal=""
   case "$ready_signal" in
-    no-auto|draft|armed) return 1 ;;
+    no-auto|draft) return 1 ;;
   esac
 
-  # Gate 4 — require the Build policy to be APPROVED (green), not merely "not failing".
-  # While a build is queued/running we must WAIT, not dispatch — otherwise a PR whose
-  # build is still in flight would be re-queued on every cycle. Require ≥1 Build policy
-  # and ALL Build policies approved.
+  # Gate 4 — require every BLOCKING Build policy to be APPROVED (green), not merely
+  # "not failing". While a blocking build is queued/running we must WAIT, not dispatch.
+  # Non-blocking build policies (notably manual-only Android/iOS validation) can remain
+  # queued forever without preventing ADO from merging. Counting them as mandatory made
+  # a green, resolved, auto-complete-armed PR permanently invisible to recovery.
   local project_id
   project_id=$(echo "$pr_json" | jq -r '.repository.project.id // empty' 2>/dev/null)
   if [ -z "$project_id" ]; then
@@ -174,9 +177,24 @@ pr_is_ready_but_unmerged() {
   policy_evals=$(ado_api_call "$policy_url" 2>/dev/null) || return 1
 
   local build_total build_approved
-  build_total=$(echo "$policy_evals" | jq --arg bpt "$BUILD_POLICY_TYPE_ID" '[.value[]? | select(.configuration.type.id == $bpt)] | length' 2>/dev/null || echo "0")
-  build_approved=$(echo "$policy_evals" | jq --arg bpt "$BUILD_POLICY_TYPE_ID" '[.value[]? | select(.configuration.type.id == $bpt and .status == "approved")] | length' 2>/dev/null || echo "0")
-  [ "$build_total" -gt 0 ] && [ "$build_total" -eq "$build_approved" ]
+  build_total=$(echo "$policy_evals" | jq --arg bpt "$BUILD_POLICY_TYPE_ID" '[.value[]? | select(.configuration.type.id == $bpt and .configuration.isBlocking == true and .configuration.isEnabled == true)] | length' 2>/dev/null || echo "0")
+  build_approved=$(echo "$policy_evals" | jq --arg bpt "$BUILD_POLICY_TYPE_ID" '[.value[]? | select(.configuration.type.id == $bpt and .configuration.isBlocking == true and .configuration.isEnabled == true and .status == "approved")] | length' 2>/dev/null || echo "0")
+  # No blocking build policy means there is nothing ADO would wait on. If blocking
+  # policies exist, all of them must be approved; queued/running/rejected is not ready.
+  if [ "$build_total" -gt 0 ] && [ "$build_total" -ne "$build_approved" ]; then
+    return 1
+  fi
+
+  # An unarmed PR with green blocking builds is ready for the merge/approval gate.
+  [ "$ready_signal" = "ready" ] && return 0
+
+  # Armed is not necessarily complete: ADO can have auto-complete set while the
+  # required-reviewer policy is still queued because the merge vote was never cast.
+  # Recover exactly that state. Once every blocking non-build policy is approved,
+  # the armed PR is genuinely complete and must not be re-dispatched.
+  local review_pending
+  review_pending=$(echo "$policy_evals" | jq --arg bpt "$BUILD_POLICY_TYPE_ID" '[.value[]? | select(.configuration.isBlocking == true and .configuration.isEnabled == true and .configuration.type.id != $bpt and .status != "approved")] | length' 2>/dev/null || echo "0")
+  [ "$review_pending" -gt 0 ]
 }
 
 # Build a synthetic webhook payload for a PR
