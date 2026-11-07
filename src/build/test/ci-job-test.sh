@@ -19,9 +19,19 @@ checks = 0
 
 def check(value, message):
     global checks
-    assert value, message
+    if not value:
+        raise AssertionError(message)
     checks += 1
     print('PASS:', message)
+
+# This guard must itself survive -O/PYTHONOPTIMIZE, including a regression in check().
+try:
+    check(False, 'intentional negative check probe')
+except AssertionError:
+    pass
+else:
+    raise RuntimeError('check() accepted a false value; regression checks are disabled')
+check(checks == 0, 'failed check raises without being counted as a pass')
 
 with tempfile.TemporaryDirectory(prefix='harness-ci-test-') as temp:
     root = pathlib.Path(temp)
@@ -119,6 +129,31 @@ esac''')
     link.symlink_to(second, target_is_directory=True)
     result = run('cleanup', overrides={'CI_JOB_DIR': str(link)})
     check(result.returncode != 0 and second.exists(), 'cleanup refuses a symlink to another job directory')
+
+    nested = first / 'nested'
+    outside = work / 'outside-job'
+    empty_suffix = agent_temp / 'harness-ci.'
+    for target in [nested, outside, empty_suffix]:
+        target.mkdir()
+        (target / '.job-id').write_text(env['SYSTEM_JOBID'] + '\n')
+        (target / '.docker-host').write_text(env['DOCKER_HOST'] + '\n')
+    # Matching markers must not permit nested, traversing or aliased paths.
+    invalid_paths = [
+        (str(nested), nested, 'nested child'),
+        (str(first) + '/../' + second.name, second, 'traversal to a sibling'),
+        (str(first) + '/../../outside-job', outside, 'traversal outside agent temp'),
+        (str(first) + '/.', first, 'dot path component'),
+        (str(first) + '/', first, 'trailing slash'),
+        (str(link) + '/', second, 'symlink with trailing slash'),
+        (str(empty_suffix), empty_suffix, 'empty job-name suffix'),
+    ]
+    for invalid, target, label in invalid_paths:
+        for command in ['cleanup-image', 'cleanup']:
+            before = log.read_text()
+            result = run(command, overrides={'CI_JOB_DIR': invalid})
+            check(result.returncode != 0 and target.is_dir() and log.read_text() == before,
+                  command + ' refuses ' + label + ' without touching state or Docker')
+
     result = run('cleanup', overrides={'CI_JOB_DIR': str(first)})
     check(result.returncode == 0 and not first.exists() and second.exists(), 'cleanup leaves sibling job state intact')
 

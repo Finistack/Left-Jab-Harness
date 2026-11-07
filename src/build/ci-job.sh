@@ -59,10 +59,10 @@ check_node() {
 
 owned_job_dir() {
   [[ -n "${CI_JOB_DIR:-}" && -d "$CI_JOB_DIR" ]] || return 1
-  case "$CI_JOB_DIR" in
-    "${AGENT_TEMPDIRECTORY:?}"/harness-ci.*) ;;
-    *) fail 'refusing cleanup outside the job temporary directory' ;;
-  esac
+  local job_name="${CI_JOB_DIR##*/}"
+  # Shell wildcard * also matches /. Require exactly one child path component.
+  [[ "$CI_JOB_DIR" == "${AGENT_TEMPDIRECTORY:?}/$job_name" && "$job_name" == harness-ci.?* ]] \
+    || fail 'refusing cleanup outside a direct job temporary directory'
   [[ ! -L "$CI_JOB_DIR" && -f "$CI_JOB_DIR/.job-id" ]] || fail 'missing job ownership marker'
   [[ "$(cat "$CI_JOB_DIR/.job-id")" == "${SYSTEM_JOBID:?}" ]] || fail 'job ownership mismatch'
 }
