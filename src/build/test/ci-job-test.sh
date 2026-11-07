@@ -131,9 +131,37 @@ esac''')
 # Check the shipped YAML contract without adding a YAML-parser dependency to CI.
 build = (repo / 'azure-pipelines.yml').read_text()
 review = (repo / 'claude-pr-review-pipeline.yml').read_text()
+def has_static_linux_demands(text, expected_pools):
+    # Agent admission does not expand a whole-demand macro. Inspect every pool block.
+    lines = text.splitlines()
+    demands = []
+    for i, line in enumerate(lines):
+        if line.strip() != 'demands:':
+            continue
+        indent = len(line) - len(line.lstrip())
+        values = []
+        for child in lines[i + 1:]:
+            if not child.strip() or child.lstrip().startswith('#'):
+                continue
+            if len(child) - len(child.lstrip()) <= indent:
+                break
+            if not child.strip().startswith('- '):
+                return False
+            values.append(child.strip()[2:])
+        demands.append(values)
+    return len(demands) == expected_pools and all(values == ['Agent.OS -equals Linux'] for values in demands)
+
 for name, text in [('build', build), ('review', review)]:
+    expected_pools = 2 if name == 'build' else 1
     check('vmImage:' not in text and 'name: $(selfHostedPool)' in text, name + ' requires configured self-hosted pool')
-    check('- $(selfHostedLinuxDemand)' in text and '- Agent.OS -equals Linux' in text, name + ' keeps Linux demands generic')
+    check(has_static_linux_demands(text, expected_pools), name + ' uses only the static Linux admission demand')
+    old_runtime_demand = re.sub(r'(?m)^( +)- Agent.OS -equals Linux$',
+                               r'\1- Agent.OS -equals Linux\n\1- $(unsupportedDemand)', text)
+    check(not has_static_linux_demands(old_runtime_demand, expected_pools), name + ' regression rejects literal whole-demand runtime macros')
+    compile_time_demand = old_runtime_demand.replace('$(unsupportedDemand)', '${{ variables.unsupportedDemand }}')
+    check(not has_static_linux_demands(compile_time_demand, expected_pools), name + ' rejects unverified compile-time demand variables')
+    missing_demand_block = re.sub(r'(?m)^ +demands:\n +- Agent.OS -equals Linux\n', '', text, count=1)
+    check(not has_static_linux_demands(missing_demand_block, expected_pools), name + ' rejects a pool with its whole demand block removed')
     check('clean: all' in text and 'clean: true' in text, name + ' cleans persistent workspace and checkout')
 check('sudo apt' not in build, 'CI never installs system packages')
 check('npm install -g' not in review and '--prefix "$CI_JOB_DIR/cli"' in review, 'review install is job-local')

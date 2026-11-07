@@ -11,7 +11,6 @@
 # (see src/build/pr-bot/docs/pipeline-setup.md):
 #
 #   selfHostedPool                   - authorized Linux pool (definition variable)
-#   selfHostedLinuxDemand            - complete capability demand for the Linux profile
 #   containerRegistry                - container registry login server (e.g. <name>.azurecr.io)
 #   imageRepository                  - image repository/name (e.g. left-jab-harness)
 #
@@ -81,7 +80,6 @@ stages:
           name: $(selfHostedPool)
           demands:
             - Agent.OS -equals Linux
-            - $(selfHostedLinuxDemand)
         workspace:
           clean: all
         steps:
@@ -135,7 +133,6 @@ stages:
           name: $(selfHostedPool)
           demands:
             - Agent.OS -equals Linux
-            - $(selfHostedLinuxDemand)
         workspace:
           clean: all
         steps:

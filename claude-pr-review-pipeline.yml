@@ -14,7 +14,7 @@
 #   policy, so the `pr:` trigger is how a GitHub PR starts the run.
 #
 # SITE-SPECIFIC CONFIG (never committed — set as pipeline variables / variable group):
-#   - selfHostedPool / selfHostedLinuxDemand — authorized pool and Linux capability demand.
+#   - selfHostedPool — already-authorized Linux pool whose agents meet the CI prerequisites.
 #   - Variable group 'Build Pipelines' supplies ANTHROPIC_* (base url, token, models).
 #   - GH_REVIEW_PAT (SECRET) — fine-grained PAT of the review BOT account
 #       (Pull requests: Read+write on this repo only). Used to post comments, resolve
@@ -35,7 +35,6 @@ pool:
   name: $(selfHostedPool)
   demands:
     - Agent.OS -equals Linux
-    - $(selfHostedLinuxDemand)
 
 variables:
   - group: 'Build Pipelines'

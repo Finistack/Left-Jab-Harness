@@ -61,7 +61,6 @@ The YAML requires these site-specific inputs:
 | Variable | Purpose | Example |
 |----------|---------|---------|
 | `selfHostedPool` | Already-authorized persistent Linux pool | `<linux-pool>` |
-| `selfHostedLinuxDemand` | Complete Linux capability demand | `HostProfile -equals linux-v1` |
 | `containerRegistry` | Registry login server | `<name>.azurecr.io` |
 | `imageRepository` | Image repository / name | `left-jab-harness` |
 

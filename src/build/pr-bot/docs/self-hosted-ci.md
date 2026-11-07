@@ -1,16 +1,21 @@
 # Self-hosted CI prerequisites
 
-Both Azure Pipelines use a trusted, persistent Linux pool. Configure these non-secret
-variables on **each** build definition before using the YAML:
+Both Azure Pipelines use a trusted, persistent Linux pool. Configure this non-secret
+variable on **each** build definition before using the YAML:
 
 | Variable | Value |
 | --- | --- |
 | `selfHostedPool` | Name of the already-authorized self-hosted pool |
-| `selfHostedLinuxDemand` | Complete capability demand, for example `HostProfile -equals linux-v1` |
 
-Pool names, site-specific capability names, endpoints and credentials do not belong in
-this public repository. A missing variable must not silently select a hosted agent.
-Both pipelines also demand `Agent.OS -equals Linux`.
+Pool names, endpoints and credentials do not belong in this public repository. A missing
+pool variable must not silently select a hosted agent. Both pipelines use the static
+`Agent.OS -equals Linux` demand and the fail-closed tool and endpoint checks below. Select
+a pool whose Linux agents meet this contract; future agents must meet it too.
+
+Do not put a variable macro around a complete capability demand: Azure DevOps can treat
+that macro as a literal demand at admission, even when a YAML preview succeeds. Definition
+variables are also unavailable in the attempted compile-time demand expression. Keep the
+admission demand static and generic rather than adding site-specific capability names.
 
 ## Trust boundary
 
@@ -65,9 +70,9 @@ abandoned disk state and Docker build cache. Later jobs do not reuse a prior rev
 ## Rollout and validation
 
 1. Verify existing fork protections, pool authorization, required tools and private endpoints.
-2. Set both definition variables without adding credentials or changing permissions.
+2. Set `selfHostedPool` on both definitions without adding credentials or changing permissions.
 3. Validate both YAML files with Azure DevOps `previewRun: true`. This compiles YAML without
-   queueing a run; it does **not** prove runtime macro expansion, agent admission or Docker
+   queueing a run; it does **not** prove pool-variable resolution, agent admission or Docker
    endpoint selection inside a task.
 4. After normal code review/publication, verify the actual next authorized build/review uses
    the intended pool and Linux agent. Check Node20, image tagging/push, review output artifact

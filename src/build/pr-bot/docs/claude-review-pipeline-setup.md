@@ -118,7 +118,6 @@ az pipelines run --name left-jab-harness-review \
 | Variable | Where | Secret? | Purpose |
 |----------|-------|---------|---------|
 | `selfHostedPool` | pipeline var | no | Already-authorized persistent Linux pool. |
-| `selfHostedLinuxDemand` | pipeline var | no | Complete Linux capability demand, for example `HostProfile -equals linux-v1`. |
 | `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_MODEL` / `ANTHROPIC_SMALL_FAST_MODEL` | `Build Pipelines` group | token: **yes** | Claude CLI endpoint/auth/models (shared with the other pipelines). |
 | `GH_REVIEW_PAT` | pipeline var | **yes** | Bot's fine-grained PAT (Pull requests: R/W, this repo only). Posts comments, resolves threads, casts `APPROVE`. |
 | `GH_BOT_LOGIN` | pipeline var | no | Bot login; used for human-reply detection + dedup. Poster falls back to `GET /user` if unset. |
