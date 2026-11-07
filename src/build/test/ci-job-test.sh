@@ -66,9 +66,15 @@ with tempfile.TemporaryDirectory(prefix='harness-ci-test-') as temp:
 case "$1 $2" in
  'info --format') exit "${MOCK_DOCKER_INFO_FAIL:-0}" ;;
  'image inspect')
-   case "${@: -1}" in
+   ref="${@: -1}"
+   if [[ "$ref" == "${MOCK_DOCKER_INSPECT_FAIL_REF:-}" ]]; then
+     printf '%s\n' "${MOCK_DOCKER_INSPECT_ERROR:-Cannot connect to the Docker daemon}" >&2
+     exit 1
+   fi
+   [[ "$ref" != "${MOCK_DOCKER_INSPECT_EMPTY_REF:-}" ]] || exit 0
+   case "$ref" in
      *:foreign) echo sha256:other ;;
-     *:missing) exit 1 ;;
+     *:missing) printf 'Error response from daemon: No such image: %s\n' "$ref" >&2; exit 1 ;;
      *) echo sha256:owned ;;
    esac ;;
  'image rm') exit "${MOCK_DOCKER_RM_FAIL:-0}" ;;
@@ -116,6 +122,47 @@ esac''')
     check(result.returncode == 0, 'owned image cleanup succeeds')
     removed = [x[len('image rm '):] for x in log.read_text().splitlines() if x.startswith('image rm ')]
     check(removed == [refs[0], 'harness-ci:job-one'], 'cleanup removes only recorded refs still pointing to this image')
+    # Distinguish definite absence from daemon/permission/format failures.
+    for message in [
+        'Cannot connect to the Docker daemon',
+        'permission denied while trying to connect to the Docker API',
+        'unrecognized Docker inspection failure',
+        'Error response from daemon: No such image: another-image',
+        'Error response from daemon: No such image: ' + env['LOCAL_IMAGE'] + '\ntransport failure',
+    ]:
+        before = log.read_text()
+        result = run('cleanup-image', overrides={
+            'CI_JOB_DIR': str(first), 'MOCK_DOCKER_INSPECT_FAIL_REF': env['LOCAL_IMAGE'],
+            'MOCK_DOCKER_INSPECT_ERROR': message})
+        new_calls = log.read_text()[len(before):]
+        check(result.returncode != 0 and 'image rm ' not in new_calls,
+              'ownership inspect error fails without removals: ' + message.splitlines()[0])
+        check(message in result.stderr, 'ownership inspect error remains visible in diagnostics')
+
+    for prefix in ['Error response from daemon: No such image: ', 'Error: No such image: ']:
+        before = log.read_text()
+        result = run('cleanup-image', overrides={
+            'CI_JOB_DIR': str(first), 'MOCK_DOCKER_INSPECT_FAIL_REF': env['LOCAL_IMAGE'],
+            'MOCK_DOCKER_INSPECT_ERROR': prefix + env['LOCAL_IMAGE']})
+        check(result.returncode == 0 and 'image rm ' not in log.read_text()[len(before):],
+              'definitely absent ownership image is a safe no-op: ' + prefix.strip())
+
+    before = log.read_text()
+    result = run('cleanup-image', overrides={
+        'CI_JOB_DIR': str(first), 'MOCK_DOCKER_INSPECT_EMPTY_REF': env['LOCAL_IMAGE']})
+    check(result.returncode != 0 and 'image rm ' not in log.read_text()[len(before):],
+          'successful inspect with empty ID is not mistaken for absence')
+
+    before = log.read_text()
+    result = run('cleanup-image', overrides={
+        'CI_JOB_DIR': str(first), 'MOCK_DOCKER_INSPECT_FAIL_REF': refs[0]})
+    removed_after_error = [line[len('image rm '):] for line in log.read_text()[len(before):].splitlines()
+                           if line.startswith('image rm ')]
+    check(result.returncode != 0 and 'Cannot connect to the Docker daemon' in result.stderr,
+          'recorded-reference inspect failure is reported and fails cleanup')
+    check(removed_after_error == [env['LOCAL_IMAGE']],
+          'reference failure never removes unverifiable or foreign refs; other owned refs still clean')
+
     result = run('cleanup-image', overrides={'CI_JOB_DIR': str(first), 'MOCK_DOCKER_RM_FAIL': '1'})
     check(result.returncode != 0, 'image removal failure is reported rather than hidden')
     before = log.read_text()

@@ -67,6 +67,23 @@ owned_job_dir() {
   [[ "$(cat "$CI_JOB_DIR/.job-id")" == "${SYSTEM_JOBID:?}" ]] || fail 'job ownership mismatch'
 }
 
+image_id_or_absent() {
+  local ref="$1" image_id error_text
+  local error_file="${CI_JOB_DIR:?}/docker-inspect.stderr"
+  if image_id=$(LC_ALL=C docker image inspect --format '{{.Id}}' "$ref" 2>"$error_file"); then
+    [[ -n "$image_id" ]] || { echo "CI cleanup: inspect returned no ID for $ref" >&2; return 1; }
+    printf '%s\n' "$image_id"
+    return 0
+  fi
+  error_text=$(<"$error_file")
+  # Only a definite absence is a successful empty result. Unknown/combined errors fail closed.
+  case "$error_text" in
+    "Error response from daemon: No such image: $ref"|"Error: No such image: $ref") return 0 ;;
+  esac
+  printf 'CI cleanup: failed to inspect image %s\n%s\n' "$ref" "$error_text" >&2
+  return 1
+}
+
 cleanup_image() {
   # A failed preflight must not even query a default/shared Docker daemon in cleanup.
   owned_job_dir || return 0
@@ -76,13 +93,14 @@ cleanup_image() {
   local image_id ref ref_id failed=0
   local -a refs=()
   # The unique local ref is the ownership record. Never remove by ID or prune a daemon.
-  image_id=$(docker image inspect --format '{{.Id}}' "${LOCAL_IMAGE:?}" 2>/dev/null) || return 0
+  image_id=$(image_id_or_absent "${LOCAL_IMAGE:?}") || return 1
+  [[ -n "$image_id" ]] || return 0
   if [[ -f "$CI_JOB_DIR/published-image-refs" ]]; then
     mapfile -t refs < "$CI_JOB_DIR/published-image-refs"
   fi
   refs+=("$LOCAL_IMAGE")
   for ref in "${refs[@]}"; do
-    ref_id=$(docker image inspect --format '{{.Id}}' "$ref" 2>/dev/null) || continue
+    ref_id=$(image_id_or_absent "$ref") || { failed=1; continue; }
     if [[ "$ref_id" == "$image_id" ]]; then
       docker image rm "$ref" || failed=1
     fi
