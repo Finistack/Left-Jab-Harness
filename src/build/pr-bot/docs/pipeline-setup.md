@@ -56,12 +56,17 @@ az pipelines create \
 ## 3. Set the required pipeline variables
 
 Set these on the pipeline (UI: *Edit → Variables*, or `az pipelines variable create`).
-They are the **only** site-specific inputs the YAML needs:
+The YAML requires these site-specific inputs:
 
 | Variable | Purpose | Example |
 |----------|---------|---------|
+| `selfHostedPool` | Already-authorized persistent Linux pool | `<linux-pool>` |
+| `selfHostedLinuxDemand` | Complete Linux capability demand | `HostProfile -equals linux-v1` |
 | `containerRegistry` | Registry login server | `<name>.azurecr.io` |
 | `imageRepository` | Image repository / name | `left-jab-harness` |
+
+Before selecting a persistent pool, follow the [self-hosted CI prerequisites](./self-hosted-ci.md),
+including effective fork protection, per-slot Docker endpoints and job-state cleanup.
 
 Push does **not** use a docker-registry service connection. The registry has **ARM audience
 token authentication disabled** (workload-hardening policy `42781ec6`, the MDC control), so the

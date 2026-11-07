@@ -10,6 +10,8 @@
 # environment configuration. Define these when you create the pipeline
 # (see src/build/pr-bot/docs/pipeline-setup.md):
 #
+#   selfHostedPool                   - authorized Linux pool (definition variable)
+#   selfHostedLinuxDemand            - complete capability demand for the Linux profile
 #   containerRegistry                - container registry login server (e.g. <name>.azurecr.io)
 #   imageRepository                  - image repository/name (e.g. left-jab-harness)
 #
@@ -64,7 +66,6 @@ resources:
   - repo: self
 
 variables:
-  vmImageName: 'ubuntu-latest'
   dockerfilePath: 'src/build/pr-bot/Dockerfile'
   # Full-semver image tag. Build.BuildNumber is the monotonic counter pinned via `name:` above,
   # so this renders MAJOR.MINOR.PATCH (e.g. 1.0.7). Bump 1.0 by hand for a real minor/major.
@@ -77,17 +78,23 @@ stages:
       - job: LintTest
         displayName: 'shellcheck + bash suites'
         pool:
-          vmImage: $(vmImageName)
+          name: $(selfHostedPool)
+          demands:
+            - Agent.OS -equals Linux
+            - $(selfHostedLinuxDemand)
+        workspace:
+          clean: all
         steps:
           - checkout: self
+            clean: true
+            persistCredentials: false
             fetchDepth: 1
 
-          - script: |
-              set -euo pipefail
-              sudo apt-get update
-              sudo apt-get install -y --no-install-recommends shellcheck
-              shellcheck --version
-            displayName: 'Install shellcheck'
+          - script: bash src/build/ci-job.sh prepare lint
+            displayName: 'Check Linux agent prerequisites'
+
+          - script: shellcheck --version
+            displayName: 'Check preinstalled shellcheck'
 
           - script: |
               set -euo pipefail
@@ -111,6 +118,12 @@ stages:
               exit "$fail"
             displayName: 'Run bash test suites'
 
+          - script: bash src/build/ci-job.sh cleanup
+            displayName: 'Clean job temporary state'
+            condition: always()
+            env:
+              CI_JOB_DIR: $(ciJobDir)
+
   - stage: Build
     displayName: 'Build container image'
     dependsOn: Validate
@@ -119,10 +132,22 @@ stages:
       - job: BuildImage
         displayName: 'docker build (push on main)'
         pool:
-          vmImage: $(vmImageName)
+          name: $(selfHostedPool)
+          demands:
+            - Agent.OS -equals Linux
+            - $(selfHostedLinuxDemand)
+        workspace:
+          clean: all
         steps:
           - checkout: self
+            clean: true
+            persistCredentials: false
             fetchDepth: 1
+
+          - script: bash src/build/ci-job.sh prepare build
+            displayName: 'Check private Docker endpoint and prepare job state'
+            env:
+              AGENT_WORKFOLDER: $(Agent.WorkFolder)
 
           # Build only. The ACR has "ARM audience token authentication" disabled
           # (workload-hardening policy 42781ec6, the MDC control), so the Docker@2 task must
@@ -136,17 +161,16 @@ stages:
             # the shared registry (both supplied as pipeline variables).
             inputs:
               command: build
-              repository: $(containerRegistry)/$(imageRepository)
+              repository: harness-ci
               dockerfile: $(dockerfilePath)
               # Build context = repo root so COPY src/build resolves and root .dockerignore
               # (secret/state exclusions) is honored.
               buildContext: '$(Build.SourcesDirectory)'
-              # Tag with both the semver (chart-pinnable) and the commit SHA (traceability:
-              # the monotonic counter alone can't map an image back to its source commit).
-              tags: |
-                $(imageTag)
-                $(Build.SourceVersion)
-                latest
+              # A unique local tag prevents concurrent runs/retries sharing image refs.
+              # Public semver/commit/latest tags are applied only when pushing below.
+              tags: $(System.JobId)
+            env:
+              DOCKER_CONFIG: $(ciJobDir)/docker
 
           # Push with a containerregistry-scoped AAD token, which is unaffected by the
           # ARM-auth policy. CI (main / schedule) only; PR builds stop after the image builds.
@@ -168,10 +192,33 @@ stages:
                 source src/build/acr-scoped-login.sh
                 acr_scoped_login
                 for tag in "$IMAGE_TAG" "$SOURCE_VERSION" latest; do
+                  docker tag "$LOCAL_IMAGE" "$CONTAINER_REGISTRY/$IMAGE_REPOSITORY:$tag"
+                  printf '%s\n' "$CONTAINER_REGISTRY/$IMAGE_REPOSITORY:$tag" >> "$CI_JOB_DIR/published-image-refs"
                   docker push "$CONTAINER_REGISTRY/$IMAGE_REPOSITORY:$tag"
                 done
             env:
+              CI_JOB_DIR: $(ciJobDir)
+              LOCAL_IMAGE: harness-ci:$(System.JobId)
+              DOCKER_CONFIG: $(ciJobDir)/docker
               CONTAINER_REGISTRY: $(containerRegistry)
               IMAGE_REPOSITORY: $(imageRepository)
               IMAGE_TAG: $(imageTag)
               SOURCE_VERSION: $(Build.SourceVersion)
+
+          - script: bash src/build/ci-job.sh cleanup-image
+            displayName: 'Remove only this job image references'
+            condition: and(always(), ne(variables['ciJobDir'], ''))
+            env:
+              DOCKER_CONFIG: $(ciJobDir)/docker
+              CI_JOB_DIR: $(ciJobDir)
+              LOCAL_IMAGE: harness-ci:$(System.JobId)
+              CONTAINER_REGISTRY: $(containerRegistry)
+              IMAGE_REPOSITORY: $(imageRepository)
+              IMAGE_TAG: $(imageTag)
+              SOURCE_VERSION: $(Build.SourceVersion)
+
+          - script: bash src/build/ci-job.sh cleanup
+            displayName: 'Clean job temporary state'
+            condition: always()
+            env:
+              CI_JOB_DIR: $(ciJobDir)
