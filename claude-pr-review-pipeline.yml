@@ -14,6 +14,7 @@
 #   policy, so the `pr:` trigger is how a GitHub PR starts the run.
 #
 # SITE-SPECIFIC CONFIG (never committed — set as pipeline variables / variable group):
+#   - selfHostedPool — already-authorized Linux pool whose agents meet the CI prerequisites.
 #   - Variable group 'Build Pipelines' supplies ANTHROPIC_* (base url, token, models).
 #   - GH_REVIEW_PAT (SECRET) — fine-grained PAT of the review BOT account
 #       (Pull requests: Read+write on this repo only). Used to post comments, resolve
@@ -31,7 +32,9 @@ pr:
       - main
 
 pool:
-  vmImage: 'ubuntu-latest'
+  name: $(selfHostedPool)
+  demands:
+    - Agent.OS -equals Linux
 
 variables:
   - group: 'Build Pipelines'
@@ -39,77 +42,103 @@ variables:
   - name: MAX_DIFF_BYTES
     value: '400000'
 
-steps:
-  - checkout: self
-    # Full history so `git diff origin/<target>...HEAD` has the merge base.
-    fetchDepth: 0
+jobs:
+  - job: Review
+    workspace:
+      clean: all
+    steps:
+      - checkout: self
+        clean: true
+        persistCredentials: false
+        # Full history so `git diff origin/<target>...HEAD` has the merge base.
+        fetchDepth: 0
 
-  - task: UseNode@1
-    displayName: 'Use Node.js 20.x'
-    inputs:
-      version: '20.x'
+      - script: bash src/build/ci-job.sh prepare review
+        displayName: 'Prepare isolated review state'
 
-  - script: npm install -g @anthropic-ai/claude-code
-    displayName: 'Install Claude Code CLI'
+      - task: UseNode@1
+        displayName: 'Use Node.js 20.x'
+        inputs:
+          version: '20.x'
 
-  - script: |
-      set -euo pipefail
-      TARGET="${TARGET_BRANCH:-main}"
-      git fetch --no-tags origin "$TARGET" 2>/dev/null || true
-      git diff "origin/$TARGET...HEAD" > /tmp/pr-diff.txt || git diff "origin/$TARGET..HEAD" > /tmp/pr-diff.txt
+      - script: |
+          set -euo pipefail
+          bash src/build/ci-job.sh check-node
+          npm install --prefix "$CI_JOB_DIR/cli" --cache "$CI_JOB_DIR/npm-cache" \
+            --no-audit --no-fund @anthropic-ai/claude-code
+        displayName: 'Install job-local Claude Code CLI'
+        env:
+          CI_JOB_DIR: $(ciJobDir)
 
-      DIFF_SIZE=$(wc -c < /tmp/pr-diff.txt)
-      echo "PR diff size: $DIFF_SIZE bytes (target=$TARGET, cap=${MAX_DIFF_BYTES})"
+      - script: |
+          set -euo pipefail
+          TARGET="${TARGET_BRANCH:-main}"
+          git fetch --no-tags origin "$TARGET" 2>/dev/null || true
+          git diff "origin/$TARGET...HEAD" > "$CI_JOB_DIR/pr-diff.txt" || git diff "origin/$TARGET..HEAD" > "$CI_JOB_DIR/pr-diff.txt"
 
-      if [ "$DIFF_SIZE" -lt 10 ]; then
-        echo "No meaningful diff found, skipping review."
-        echo "[]" > /tmp/review-results.json
-        exit 0
-      fi
-      if [ "$DIFF_SIZE" -gt "${MAX_DIFF_BYTES}" ]; then
-        echo "Diff exceeds ${MAX_DIFF_BYTES} bytes; truncating for the reviewer."
-        head -c "${MAX_DIFF_BYTES}" /tmp/pr-diff.txt > /tmp/pr-diff.trunc && mv /tmp/pr-diff.trunc /tmp/pr-diff.txt
-      fi
+          DIFF_SIZE=$(wc -c < "$CI_JOB_DIR/pr-diff.txt")
+          echo "PR diff size: $DIFF_SIZE bytes (target=$TARGET, cap=${MAX_DIFF_BYTES})"
 
-      claude -p \
-        "You are a senior code reviewer. Review the following git diff for bugs, security issues, performance problems, and best-practices violations. Report ONLY issues introduced by the added/changed lines. For each issue output an object with: file (repo-relative path, NO leading slash), line (a line number that appears in the diff hunk on the new/RIGHT side), severity (critical, warning, or info), comment. Output a JSON array of such objects. If there are no issues, output []. Output ONLY valid JSON, no prose." \
-        --output-format json \
-        < /tmp/pr-diff.txt \
-        > /tmp/review-results.json 2>/tmp/claude-stderr.log || true
+          if [ "$DIFF_SIZE" -lt 10 ]; then
+            echo "No meaningful diff found, skipping review."
+            echo "[]" > "$CI_JOB_DIR/review-results.json"
+            echo "##vso[task.setvariable variable=reviewResultsReady]true"
+            exit 0
+          fi
+          if [ "$DIFF_SIZE" -gt "${MAX_DIFF_BYTES}" ]; then
+            echo "Diff exceeds ${MAX_DIFF_BYTES} bytes; truncating for the reviewer."
+            head -c "${MAX_DIFF_BYTES}" "$CI_JOB_DIR/pr-diff.txt" > "$CI_JOB_DIR/pr-diff.trunc" && mv "$CI_JOB_DIR/pr-diff.trunc" "$CI_JOB_DIR/pr-diff.txt"
+          fi
 
-      echo "--- Review Results ---"
-      cat /tmp/review-results.json
-      echo "--- Stderr ---"
-      cat /tmp/claude-stderr.log || true
-    displayName: 'Run Claude Code PR Review'
-    env:
-      ANTHROPIC_BASE_URL: $(ANTHROPIC_BASE_URL)
-      ANTHROPIC_AUTH_TOKEN: $(ANTHROPIC_AUTH_TOKEN)
-      ANTHROPIC_MODEL: $(ANTHROPIC_MODEL)
-      ANTHROPIC_SMALL_FAST_MODEL: $(ANTHROPIC_SMALL_FAST_MODEL)
-      CLAUDE_CODE_MAX_OUTPUT_TOKENS: '65536'
-      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1'
-      MAX_DIFF_BYTES: $(MAX_DIFF_BYTES)
-      # Runtime macro — resolved per-run, only inside env: (never a compile-time expression).
-      TARGET_BRANCH: $(System.PullRequest.TargetBranchName)
+          "$CI_JOB_DIR/cli/node_modules/.bin/claude" -p \
+            "You are a senior code reviewer. Review the following git diff for bugs, security issues, performance problems, and best-practices violations. Report ONLY issues introduced by the added/changed lines. For each issue output an object with: file (repo-relative path, NO leading slash), line (a line number that appears in the diff hunk on the new/RIGHT side), severity (critical, warning, or info), comment. Output a JSON array of such objects. If there are no issues, output []. Output ONLY valid JSON, no prose." \
+            --output-format json \
+            < "$CI_JOB_DIR/pr-diff.txt" \
+            > "$CI_JOB_DIR/review-results.json" 2>"$CI_JOB_DIR/claude-stderr.log" || true
 
-  - script: python3 src/build/github-pr-review.py
-    displayName: 'Post Review Comments or Approve PR'
-    env:
-      # Secret bot PAT + identity. Never echoed; secret var surfaced only here.
-      GH_REVIEW_PAT: $(GH_REVIEW_PAT)
-      GH_BOT_LOGIN: $(GH_BOT_LOGIN)
-      # GitHub PR context — ALL of these are $(...) runtime macros, env: only.
-      # PullRequestNumber (the GitHub PR #), NOT PullRequestId (Azure-Repos-only).
-      GITHUB_REPOSITORY: $(Build.Repository.Name)
-      PR_NUMBER: $(System.PullRequest.PullRequestNumber)
-      HEAD_SHA: $(System.PullRequest.SourceCommitId)
-      TARGET_BRANCH: $(System.PullRequest.TargetBranchName)
+          echo "##vso[task.setvariable variable=reviewResultsReady]true"
+          echo "--- Review Results ---"
+          cat "$CI_JOB_DIR/review-results.json"
+          echo "--- Stderr ---"
+          cat "$CI_JOB_DIR/claude-stderr.log" || true
+        displayName: 'Run Claude Code PR Review'
+        env:
+          CI_JOB_DIR: $(ciJobDir)
+          CLAUDE_CONFIG_DIR: $(ciJobDir)/claude
+          ANTHROPIC_BASE_URL: $(ANTHROPIC_BASE_URL)
+          ANTHROPIC_AUTH_TOKEN: $(ANTHROPIC_AUTH_TOKEN)
+          ANTHROPIC_MODEL: $(ANTHROPIC_MODEL)
+          ANTHROPIC_SMALL_FAST_MODEL: $(ANTHROPIC_SMALL_FAST_MODEL)
+          CLAUDE_CODE_MAX_OUTPUT_TOKENS: '65536'
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1'
+          MAX_DIFF_BYTES: $(MAX_DIFF_BYTES)
+          # Runtime macro — resolved per-run, only inside env: (never a compile-time expression).
+          TARGET_BRANCH: $(System.PullRequest.TargetBranchName)
 
-  - task: PublishPipelineArtifact@1
-    displayName: 'Publish Review Results'
-    condition: always()
-    inputs:
-      targetPath: '/tmp/review-results.json'
-      artifact: 'claude-review'
-      publishLocation: 'pipeline'
+      - script: python3 src/build/github-pr-review.py
+        displayName: 'Post Review Comments or Approve PR'
+        env:
+          # Secret bot PAT + identity. Never echoed; secret var surfaced only here.
+          REVIEW_FILE: $(ciJobDir)/review-results.json
+          GH_REVIEW_PAT: $(GH_REVIEW_PAT)
+          GH_BOT_LOGIN: $(GH_BOT_LOGIN)
+          # GitHub PR context — ALL of these are $(...) runtime macros, env: only.
+          # PullRequestNumber (the GitHub PR #), NOT PullRequestId (Azure-Repos-only).
+          GITHUB_REPOSITORY: $(Build.Repository.Name)
+          PR_NUMBER: $(System.PullRequest.PullRequestNumber)
+          HEAD_SHA: $(System.PullRequest.SourceCommitId)
+          TARGET_BRANCH: $(System.PullRequest.TargetBranchName)
+
+      - task: PublishPipelineArtifact@1
+        displayName: 'Publish Review Results'
+        condition: and(always(), eq(variables['reviewResultsReady'], 'true'))
+        inputs:
+          targetPath: '$(ciJobDir)/review-results.json'
+          artifact: 'claude-review'
+          publishLocation: 'pipeline'
+
+      - script: bash src/build/ci-job.sh cleanup
+        displayName: 'Clean isolated review state'
+        condition: always()
+        env:
+          CI_JOB_DIR: $(ciJobDir)
