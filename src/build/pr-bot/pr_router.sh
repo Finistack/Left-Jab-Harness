@@ -16,6 +16,7 @@ debug() { [[ "$VERBOSE" == "true" ]] && log "[debug] $*" || true; }
 
 # Portable base64 (GNU wraps at 76 chars by default, corrupting HTTP headers).
 # Defined early because the pluggable ADO auth helper and early status-check both use it.
+# shellcheck disable=SC2329 # reached through the sourced guard transport
 b64_encode() { base64 | tr -d '\n'; }
 
 # Pluggable ADO auth (PAT / Entra SP / Entra WI) — sourced early so get_ado_auth_header*
@@ -27,6 +28,7 @@ if [ -f "$SCRIPT_DIR/../shared/ado_auth.sh" ]; then
 fi
 # Resolve the ADO Authorization header once per call site via this wrapper; falls back
 # to a PAT Basic header if the shared helper is unavailable (keeps the bot self-contained).
+# shellcheck disable=SC2329 # reached through the sourced guard transport
 _ado_auth() { get_ado_auth_header_cached 2>/dev/null || echo "Basic $(echo -n ":${ADO_PAT:-}" | b64_encode)"; }
 
 # PR weight estimation — deterministic token proxy based on file/comment count
@@ -65,460 +67,11 @@ arm_err_trap()   { trap 'error_trap $LINENO' ERR; }
 disarm_err_trap() { trap - ERR; }
 arm_err_trap
 
-PAYLOAD="$1"
-log "📥 Router started (PID: $$) with payload (${#PAYLOAD} bytes)"
-
-# Validate payload is parseable JSON before attempting field extraction
-if ! echo "$PAYLOAD" | jq empty 2>/dev/null; then
-  log "❌ Payload is not valid JSON, skipping (handler PID: $$)"
-  log "❌ Raw payload (first 500 chars): $(echo "$PAYLOAD" | head -c 500)"
-  log "❌ Raw payload (hex, first 100 bytes): $(echo "$PAYLOAD" | xxd -l 100 -p 2>/dev/null || echo 'xxd unavailable')"
-  exit 0
-fi
-
-# Event type routing — only handle PR comment events
-EVENT_TYPE=$(echo "$PAYLOAD" | jq -r '.eventType // empty')
-case "$EVENT_TYPE" in
-  ms.vss-code.git-pullrequest-comment-event)
-    ;; # Continue — this is what we handle
-  "")
-    log "⚠️  No eventType in payload, attempting to process as PR comment"
-    ;;
-  *)
-    log "⏭️  Unhandled event type: $EVENT_TYPE, skipping"
-    exit 0
-    ;;
-esac
-
-# Defense-in-depth against the lease-comment self-trigger loop (start.sh filters this
-# at intake; this guards the deferred-queue replay path which re-injects raw payloads
-# that bypass intake). When a router PATCHes its own lease/status comment, ADO emits a
-# comment-edit event with our machine marker in .resource.comment.content. Acting on it
-# would just re-stamp the lease and emit another event — a tight CPU loop. These markers
-# are bot-internal; a human comment never carries them, so bail without dispatching work.
-_ROUTER_COMMENT_CONTENT=$(echo "$PAYLOAD" | jq -r '.resource.comment.content // empty' 2>/dev/null) || true
-case "$_ROUTER_COMMENT_CONTENT" in
-  *pr-bot-lease*|*pr-bot-status*)
-    log "⏭️  Skipping self-authored bot lease/status comment edit (no-op event, prevents self-trigger loop)"
-    exit 0
-    ;;
-esac
-
-# Log payload structure for debugging (keys only, not values which may contain secrets)
-log "📥 Payload keys: $(echo "$PAYLOAD" | jq -r 'keys | join(", ")' 2>/dev/null || echo 'unknown')"
-log "📥 Payload size: ${#PAYLOAD} bytes"
-
-# If the payload is suspiciously small, it's likely not a full ADO webhook — log and bail
-if [ "${#PAYLOAD}" -lt 100 ]; then
-  log "⚠️  Payload too small to be a valid ADO webhook (${#PAYLOAD} bytes), skipping"
-  log "⚠️  Payload keys: $(echo "$PAYLOAD" | jq -r 'keys | join(", ")' 2>/dev/null || echo '[not JSON]')"
-  exit 0
-fi
-
-# Parse ADO webhook payload
-# ADO "Pull request commented on" webhook structure:
-#   .resource.pullRequest.pullRequestId
-#   .resource.pullRequest.repository.id
-#   .resource.pullRequest.repository.name
-#   .resource.pullRequest.sourceRefName
-#   .resource.comment.id
-#   .resource.comment.content
-NOTIFICATION_ID=$(echo "$PAYLOAD" | jq -r '.notificationId // empty' 2>/dev/null) || true
-PR_ID=$(echo "$PAYLOAD" | jq -r '.resource.pullRequest.pullRequestId // empty' 2>/dev/null) || true
-
-# Deduplicate by ADO notificationId (survives ntfy replay storms)
-# Lockless check — worst case two processes both proceed, but per-PR lock + ADO lease catches them downstream
-if [ -n "$NOTIFICATION_ID" ]; then
-  SEEN_NOTIFICATIONS_FILE="$STATE_DIR/seen-notifications.log"
-  if grep -qxF "$NOTIFICATION_ID" "$SEEN_NOTIFICATIONS_FILE" 2>/dev/null; then
-    log "⏭️  Skipping duplicate ADO notification: $NOTIFICATION_ID"
-    exit 0
-  fi
-  echo "$NOTIFICATION_ID" >> "$SEEN_NOTIFICATIONS_FILE"
-  # Prune to last 1000 entries periodically
-  if [ "$(wc -l < "$SEEN_NOTIFICATIONS_FILE" 2>/dev/null || echo 0)" -gt 1200 ]; then
-    tail -1000 "$SEEN_NOTIFICATIONS_FILE" > "${SEEN_NOTIFICATIONS_FILE}.tmp" && mv "${SEEN_NOTIFICATIONS_FILE}.tmp" "$SEEN_NOTIFICATIONS_FILE"
-  fi
-fi
-REPO_ID=$(echo "$PAYLOAD" | jq -r '.resource.pullRequest.repository.id // empty' 2>/dev/null) || true
-REPO_NAME=$(echo "$PAYLOAD" | jq -r '.resource.pullRequest.repository.name // empty' 2>/dev/null) || true
-SOURCE_BRANCH=$(echo "$PAYLOAD" | jq -r '.resource.pullRequest.sourceRefName // empty' 2>/dev/null | sed 's|refs/heads/||') || true
-COMMENT_ID=$(echo "$PAYLOAD" | jq -r '.resource.comment.id // empty' 2>/dev/null) || true
-
-# Capture the PR head commit early (before any crash point) so the circuit
-# breaker can key its per-commit failure streak even if the router crashes
-# downstream. Falls back to the PR_DETAILS API fetch (done later) if absent;
-# if still empty the breaker is skipped (never key on "").
-HEAD_COMMIT=$(echo "$PAYLOAD" | jq -r '.resource.pullRequest.lastMergeSourceCommit.commitId // empty' 2>/dev/null) || true
-
-if [ -z "$PR_ID" ]; then
-  log "⚠️  Could not extract pullRequestId from payload, skipping"
-  log "⚠️  Payload structure: $(echo "$PAYLOAD" | jq -r 'keys | join(", ")' 2>/dev/null || echo 'unparseable')"
-  exit 0
-fi
-
-log "📋 Processing PR #${PR_ID} (repo: ${REPO_NAME}, branch: ${SOURCE_BRANCH})"
-
-# Detect a deliberate bracket directive (e.g. [no-bot]) in free text WITHOUT
-# false-matching prose or documentation that merely *mentions* the marker. A bare
-# substring grep (the pattern [no-auto] still uses) fires on a PR whose title or
-# body documents the marker — e.g. this very PR's title "…— [no-bot] stand-down…"
-# or a backticked `[no-bot]` in a design doc — which would make the bot stand down
-# on the wrong PRs. We treat the marker as a directive only when it stands at the
-# START of a line (allowing leading spaces and a single list/quote bullet) and is
-# NOT wrapped in backticks, i.e. an intentional `[marker]` on its own, not buried
-# mid-sentence. Usage: pr_text_has_directive "<text>" "no-bot" ; rc 0 = present.
-pr_text_has_directive() {
-  local _text="$1" _marker="$2"
-  printf '%s' "$_text" | grep -qiE "^[[:space:]]*([-*>][[:space:]]+)?\[${_marker}\]([[:space:]]|[:.]|\$)"
-}
-
-# --- Concurrency stand-down (EARLIEST possible — before lock/lease/worktree) ---
-# When a human or an interactive agent is actively driving a PR's branch, the bot
-# must NOT fetch/rebase/lease/push or create a worktree against it, or the two will
-# race on the shared remote ref (the bot's force-push/reset-hard can clobber a
-# concurrent push). Two opt-out signals, checked here with ZERO side effects:
-#
-#   Tier 1 — `[no-bot]` as a directive line in the PR title/description: full
-#            hands-off. The bot stands down entirely (symmetric with the existing
-#            `[no-auto]`, which only gates approve/complete). Matched via
-#            pr_text_has_directive so a PR that merely *documents* the marker in
-#            prose is NOT affected. The authoritative re-check happens later once
-#            PR_DETAILS is fetched (some comment webhooks omit title in the payload),
-#            and pr_heartbeat.sh skips these PRs so they are never re-dispatched.
-#   Tier 2 — a `*-wip` source branch: a human WIP scratch ref. The bot skips it so an
-#            interactive agent can stage work on `<branch>-wip` and fast-forward into
-#            the real PR ref when ready, without the bot fighting over the scratch ref.
-#
-# Both bail with exit 0 (clean, no crash marker, no circuit penalty, no lease).
-PR_BOT_WIP_SUFFIX="${PR_BOT_WIP_SUFFIX:--wip}"
-if [ -n "$PR_BOT_WIP_SUFFIX" ] && [ -n "$SOURCE_BRANCH" ] && \
-   [ "$SOURCE_BRANCH" != "${SOURCE_BRANCH%"$PR_BOT_WIP_SUFFIX"}" ]; then
-  log "🤝 PR #${PR_ID} on WIP branch '${SOURCE_BRANCH}' (suffix '${PR_BOT_WIP_SUFFIX}') — standing down, human driving"
-  exit 0
-fi
-# Best-effort early [no-bot] from the webhook payload (title/description may be absent
-# on some comment events — the authoritative PR_DETAILS-based check is the safety net).
-PAYLOAD_PR_TITLE=$(echo "$PAYLOAD" | jq -r '.resource.pullRequest.title // ""' 2>/dev/null) || true
-PAYLOAD_PR_DESC=$(echo "$PAYLOAD" | jq -r '.resource.pullRequest.description // ""' 2>/dev/null) || true
-if pr_text_has_directive "$(printf '%s\n%s' "$PAYLOAD_PR_TITLE" "$PAYLOAD_PR_DESC")" "no-bot"; then
-  log "🤝 PR #${PR_ID} tagged [no-bot] — standing down (human driving), no lease/worktree/push"
-  exit 0
-fi
-
-# --- [risk-approved] explicit HIGH-risk acceptance ---
-# This is deliberately a TITLE-only, line-anchored directive: a human must type
-# `[risk-approved]` at the start of the PR title (combined tags such as
-# `[risk-approved][SPEC] ...` are accepted). It lets the policy gate approve/arm a
-# HIGH-risk PR without weakening the independent unresolved-comment and build gates.
-# UNKNOWN risk remains refused: an unavailable classifier is not a risk decision.
-RISK_OVERRIDE=0
-if pr_text_has_directive "$PAYLOAD_PR_TITLE" "risk-approved"; then
-  RISK_OVERRIDE=1
-  log "⚠️  PR #${PR_ID} tagged [risk-approved] — explicit HIGH-risk acceptance detected"
-fi
-
-# --- [no-auto] opt-out (distinct from [no-bot]; does NOT stand the bot down) ---
-# [no-auto] keeps comment-fixing, rebasing, conflict resolution and work-item
-# linkage fully active; it ONLY disables auto-approve + auto-complete in the final
-# policy gate (a human must approve & complete). Deliberately matched with a LENIENT
-# bare substring grep (not the strict pr_text_has_directive used by [no-bot]):
-#   * low consequence if it over-fires — the bot still does all its work; a human
-#     just has to click merge — so the strict line-anchored matcher isn't needed;
-#   * it MUST match combined tags like the spec convention "[SPEC][no-auto] <Title>"
-#     (SUBMIT-RUNBOOK.md), which the line-anchored [no-bot] matcher would reject.
-# (Asymmetry is intentional: standing the bot DOWN on a wrong PR is far worse than
-# merely leaving a low-risk PR for a human to merge.) The authoritative recheck
-# below refines SKIP_AUTO when the payload lacked title/body. SKIP_AUTO is consumed
-# only at run_policy_gate, so this is otherwise inert.
-SKIP_AUTO=0
-if printf '%s\n%s' "$PAYLOAD_PR_TITLE" "$PAYLOAD_PR_DESC" | grep -qiE '\[no-auto\]'; then
-  SKIP_AUTO=1
-  log "⏸️  PR #${PR_ID} tagged [no-auto] — auto-approve/complete disabled (bot still fixes/rebases)"
-fi
-
-# --- Early bail for non-active PRs (before lease/threads/builds) ---
-# Check the webhook payload first (zero API calls)
-PAYLOAD_PR_STATUS=$(echo "$PAYLOAD" | jq -r '.resource.pullRequest.status // empty' 2>/dev/null) || true
-if [ "$PAYLOAD_PR_STATUS" = "completed" ] || [ "$PAYLOAD_PR_STATUS" = "abandoned" ]; then
-  log "⏭️  PR #${PR_ID} is not active (status: ${PAYLOAD_PR_STATUS} from payload), skipping early"
-  exit 0
-fi
-# If payload didn't have status, do a lightweight API check
-if [ -z "$PAYLOAD_PR_STATUS" ] && [ -n "$REPO_ID" ]; then
-  PR_STATUS_CHECK=$(curl -s --max-time 10 \
-    -H "Authorization: $(_ado_auth)" \
-    "https://dev.azure.com/${ADO_ORG}/${ADO_PROJECT}/_apis/git/repositories/${REPO_ID}/pullRequests/${PR_ID}?\$select=status&api-version=7.1" 2>/dev/null) || true
-  if [ -n "$PR_STATUS_CHECK" ]; then
-    EARLY_STATUS=$(echo "$PR_STATUS_CHECK" | jq -r '.status // empty' 2>/dev/null)
-    # Match known non-active statuses (completed/abandoned/2/3) rather than assuming active=1
-    if [ "$EARLY_STATUS" = "completed" ] || [ "$EARLY_STATUS" = "abandoned" ] || [ "$EARLY_STATUS" = "2" ] || [ "$EARLY_STATUS" = "3" ]; then
-      log "⏭️  PR #${PR_ID} is not active (status: ${EARLY_STATUS}), skipping early"
-      exit 0
-    fi
-  fi
-fi
-
-# --- Per-PR execution lock (EARLY) ---
-# Acquired IMMEDIATELY after PR_ID is known, BEFORE any ADO API calls or worktree
-# creation. This is the primary gate against concurrent processing of the same PR
-# when multiple webhook notifications arrive within seconds of each other.
-# Each notification has a unique notificationId, so notification dedup doesn't help —
-# we need per-PR locking to ensure only one router process does the expensive work.
-CLAUDE_TIMEOUT="${CLAUDE_TIMEOUT:-1800}"
-# Resolve the TARGET repository the bot operates on (creates worktrees in, fetches,
-# pushes). Decoupled from where the harness scripts live so the harness can run from
-# its own checkout while servicing a different repo. Precedence:
-#   1. TARGET_REPO_DIR (explicit config) — the supported production setting.
-#   2. Fallback: git toplevel of the CWD — preserves legacy behavior when the harness
-#      lived inside the same repo it serviced.
-if [ -n "${TARGET_REPO_DIR:-}" ]; then
-  REPO_ROOT=$(git -C "$TARGET_REPO_DIR" rev-parse --show-toplevel 2>/dev/null)
-else
-  REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
-fi
-if [ -z "$REPO_ROOT" ] || [ ! -d "$REPO_ROOT/.git" ]; then
-  log "❌ Cannot determine git repo root (REPO_ROOT='${REPO_ROOT:-}', TARGET_REPO_DIR='${TARGET_REPO_DIR:-}', CWD=$(pwd))"
-  log "❌ Set TARGET_REPO_DIR in config.env to an absolute path of a local clone of the repo to service"
-  exit 1
-fi
-
-# Verify git can authenticate to remote (catches missing credential helper in systemd/launchd)
-if ! git -C "$REPO_ROOT" ls-remote --exit-code origin HEAD >/dev/null 2>&1; then
-  # One-shot self-heal: the monorepo origin may still be SSH while this daemon runs with
-  # no usable SSH agent (the common cause of exit 128 here). When an ADO_PAT is available,
-  # convert origin → HTTPS and wire the PAT credential helper, then retry ONCE. The
-  # converter + its credential helper are snapshotted next to this script by start.sh, so
-  # $SCRIPT_DIR resolves them even though the router runs from the ephemeral snapshot.
-  HEALED=false
-  if [ -n "${ADO_PAT:-}" ] && [ -f "$SCRIPT_DIR/setup-git-credentials.sh" ]; then
-    log "🔧 git ls-remote failed — attempting SSH→HTTPS+PAT self-heal for origin..."
-    # shellcheck source=../setup-git-credentials.sh
-    source "$SCRIPT_DIR/setup-git-credentials.sh"
-    # Capture (don't pipe) the converter's output so `set -o pipefail` can't trip on a
-    # non-zero error count, then mirror each line into the journal for visibility.
-    HEAL_OUTPUT=$(setup_git_credentials "$REPO_ROOT" 2>&1) || true
-    while IFS= read -r _hl; do [ -n "$_hl" ] && log "    $_hl"; done <<< "$HEAL_OUTPUT"
-    if git -C "$REPO_ROOT" ls-remote --exit-code origin HEAD >/dev/null 2>&1; then
-      log "✅ Self-heal succeeded — origin reachable over HTTPS+PAT"
-      HEALED=true
-    fi
-  fi
-  if [ "$HEALED" != true ]; then
-    log "❌ git ls-remote failed — cannot reach origin"
-    log "❌ Run: ./install-service.sh  (auto-configures HTTPS + credential helper)"
-    log "❌ Or:  source '$SCRIPT_DIR/setup-git-credentials.sh' && setup_git_credentials '$REPO_ROOT'"
-    exit 1
-  fi
-fi
-PR_LOCK_DIR="$STATE_DIR/pr-${PR_ID}.lock"
-# A fresh lock dir whose PID line is still empty is a router mid-acquisition, NOT a
-# dead holder — the holder writes its PID immediately after mkdir. Any lock younger
-# than this window with no live PID is treated as "being acquired" (yield), closing
-# the TOCTOU that let two routers co-acquire one PR (see the acquire block below).
-LOCK_ACQUIRE_WINDOW_SECS="${LOCK_ACQUIRE_WINDOW_SECS:-10}"
-# Validate: must be a positive integer in [2, 30]. A value of 0 makes the
-# mid-acquire elif unreachable (re-exposing the TOCTOU); a non-numeric value
-# causes [ -lt ] to error. Clamp to the default on any invalid input.
-case "$LOCK_ACQUIRE_WINDOW_SECS" in
-  ''|*[!0-9]*) LOCK_ACQUIRE_WINDOW_SECS=10 ;;
-esac
-[ "$LOCK_ACQUIRE_WINDOW_SECS" -lt 2 ] 2>/dev/null && LOCK_ACQUIRE_WINDOW_SECS=2
-[ "$LOCK_ACQUIRE_WINDOW_SECS" -gt 30 ] 2>/dev/null && LOCK_ACQUIRE_WINDOW_SECS=30
-
-cleanup() {
-  local exit_status=$?  # Capture the REAL exit code FIRST — `set +e` is a builtin
-                        # that would reset $? to 0 (the cause of the silent #1340
-                        # loop: crash markers/breaker never saw the true code).
-  set +e  # Never let cleanup fail partway through
-  # Write lastexit BEFORE removing inflight breadcrumb (Change 3 + Thread 11785).
-  # An uncatchable SIGKILL between these two ops should leave BOTH artifacts (the
-  # safe direction: reap_jobs sees the inflight breadcrumb + a valid lastexit, giving
-  # it strictly MORE information). The old order (rm inflight first, then write
-  # lastexit) had a gap where a SIGKILL would leave NEITHER: reap_jobs would see
-  # true_rc=0 from `( router || true )` and take the success path — the silent-drop
-  # bug. Writing lastexit first closes that window.
-  if [ -n "${PR_ID:-}" ]; then
-    echo "$exit_status" > "$STATE_DIR/pr-${PR_ID}.lastexit" 2>/dev/null || true
-  fi
-  # NOW remove the in-flight breadcrumb — its absence tells start.sh "cleanup ran".
-  [ -n "${PR_ID:-}" ] && rm -f "$STATE_DIR/pr-${PR_ID}.inflight" 2>/dev/null
-  # Circuit-breaker outcome — ONLY when we actually held the lease and did work
-  # (LEASE_COMMENT_ID set). Pre-lease exits (circuit-open skip, non-active PR,
-  # duplicate, lost race) must NOT touch breaker state, so the breaker self-expires
-  # via nextRetryEpoch and stays the sole retry governor. Best-effort; never fail.
-  # Exit 75 (YIELD) is contention, NOT a defect — it must NOT record a circuit
-  # failure (that would back off a perfectly healthy PR just because a human was
-  # mid-push). It is handled in the dedicated yield block below.
-  if [ -n "${LEASE_COMMENT_ID:-}" ] && [ -n "${PR_ID:-}" ] && [ -n "${HEAD_COMMIT:-}" ] && [ "$exit_status" -ne 75 ]; then
-    if [ "$exit_status" -eq 0 ]; then
-      circuit_record_success "$PR_ID" "$HEAD_COMMIT" 2>/dev/null || true
-    else
-      circuit_record_failure "$PR_ID" "$HEAD_COMMIT" "$exit_status" 2>/dev/null || true
-    fi
-  fi
-  # Release distributed lease (best-effort)
-  if [ -n "${LEASE_THREAD_ID:-}" ]; then
-    if [ "$exit_status" -eq 0 ]; then
-      release_pr_lease "done" "pushed fixes"
-    elif [ "$exit_status" -eq 75 ]; then
-      # YIELD: release as "done" so the lease filter treats it as NON-active. This
-      # release IS the re-dispatch mechanism — pr_heartbeat.sh sees no active lease +
-      # still-actionable work (the unresolved comments/failing build we couldn't push
-      # a fix for) and re-dispatches on its next cycle (~5min), rebuilding a FRESH
-      # payload from the current PR list. We deliberately do NOT drop a deferred
-      # requeue here: that drains every ~60s and would re-invoke Claude (expensive)
-      # far tighter than the intended ~5min yield backoff. "done" (not "failed")
-      # also avoids a scary visible ⚠️ comment for what is benign branch contention.
-      release_pr_lease "done" "yielded (branch contended) — will retry"
-    else
-      release_pr_lease "failed" "exit code $exit_status"
-    fi
-  fi
-  # Write crash marker for recovery on restart. Exit 75 (yield) is NOT a crash —
-  # it self-recovers via the heartbeat (lease released non-active above), so it
-  # gets no marker and no circuit penalty.
-  if [ "$exit_status" -ne 0 ] && [ "$exit_status" -ne 75 ] && [ -n "${PR_ID:-}" ]; then
-    log "💥 PR #${PR_ID} handler crashed (exit code $exit_status)"
-    jq -n --arg pr "${PR_ID}" --arg code "$exit_status" \
-         --arg ts "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
-         --arg host "$(hostname -s 2>/dev/null || echo unknown)" \
-         --arg repo "${REPO_ID:-}" \
-         --arg lease_thread "${LEASE_THREAD_ID:-}" \
-         --arg lease_comment "${LEASE_COMMENT_ID:-}" \
-         --argjson lease_expires "${LEASE_EXPIRES:-0}" \
-         '{pr:$pr, exitCode:$code, timestamp:$ts, host:$host, repoId:$repo,
-           leaseThreadId:$lease_thread, leaseCommentId:$lease_comment,
-           leaseExpires:($lease_expires|tonumber)}' \
-      > "$STATE_DIR/pr-${PR_ID}.crashed" 2>/dev/null || true
-  fi
-  # Clean up worktree when done (branch persists in the repo).
-  # $WORK_DIR is keyed on PR id AND this router's PID ($WORKTREE_DIR/pr-<ID>-<PID>),
-  # so it is unique to THIS run — no sibling router can be inside it, and our rm -rf
-  # can only ever delete our own directory. (Pre-PID, the path was shared per-PR and
-  # a sibling's cleanup could yank the dir out from under a live router → exit 128.)
-  if [ -n "${WORK_DIR:-}" ] && [ -d "$WORK_DIR" ]; then
-    log "🧹 Removing worktree for PR #${PR_ID} (normal exit cleanup)..."
-    git -C "$REPO_ROOT" worktree remove --force "$WORK_DIR" 2>/dev/null || true
-    rm -rf "$WORK_DIR" 2>/dev/null || true
-    git -C "$REPO_ROOT" worktree prune 2>/dev/null || true
-  fi
-  # Release per-PR execution lock
-  rm -f "$STATE_DIR/pr-${PR_ID}.lock/pid" 2>/dev/null
-  rmdir "$STATE_DIR/pr-${PR_ID}.lock" 2>/dev/null || true
-}
-trap cleanup EXIT
-# In-flight breadcrumb: created the instant the EXIT trap is armed, removed by
-# cleanup() on ANY catchable exit. If it SURVIVES after the router process ends, the
-# router was hard-killed by an uncatchable signal (macOS jetsam SIGKILL / OOM /
-# _kill_subtree) and cleanup() never ran. start.sh's reap_jobs reads this to tell a
-# real "✅ success" from a SIGKILL that the ( router || true ) wrapper masks as rc 0.
-# It is created HERE — AFTER every pre-trap early-bail (unhandled event, duplicate
-# notification, [no-bot], *-wip, inactive PR, self-edit) has already exited 0 — so
-# those legitimate skips never leave a breadcrumb and are never misread as crashes.
-INFLIGHT_FILE="$STATE_DIR/pr-${PR_ID}.inflight"
-: > "$INFLIGHT_FILE" 2>/dev/null || true
-
-if ! mkdir "$PR_LOCK_DIR" 2>/dev/null; then
-  # Lock exists — check if the holding process is still alive before declaring stale
-  _pr_lock_ts=$(head -1 "$PR_LOCK_DIR/pid" 2>/dev/null || echo 0)
-  _pr_lock_pid=$(sed -n '2p' "$PR_LOCK_DIR/pid" 2>/dev/null || echo 0)
-  _pr_lock_lstart=$(sed -n '3p' "$PR_LOCK_DIR/pid" 2>/dev/null || echo "")
-  _pr_lock_age=$(( $(date +%s) - _pr_lock_ts ))
-
-  if [ "$_pr_lock_pid" -gt 0 ] 2>/dev/null && kill -0 "$_pr_lock_pid" 2>/dev/null; then
-    # PID alive — check lstart for PID reuse, consistent with pr_lease.sh pattern.
-    # If lstart was recorded and differs from current, the PID was recycled → reclaim.
-    # If no lstart recorded (old lock file format), safe direction: treat as held.
-    if [ -n "$_pr_lock_lstart" ]; then
-      _pr_current_lstart=$(ps -o lstart= -p "$_pr_lock_pid" 2>/dev/null | xargs) || _pr_current_lstart=""
-      if [ -n "$_pr_current_lstart" ] && [ "$_pr_lock_lstart" != "$_pr_current_lstart" ]; then
-        log "🧹 Reclaiming PR lock for #${PR_ID} (PID $_pr_lock_pid recycled: lstart='${_pr_current_lstart}' != recorded='${_pr_lock_lstart}')"
-        rm -f "$PR_LOCK_DIR/pid" 2>/dev/null
-        rmdir "$PR_LOCK_DIR" 2>/dev/null || true
-        mkdir "$PR_LOCK_DIR" 2>/dev/null || { log "⏭️  PR #${PR_ID} lock race — another process won, skipping"; exit 0; }
-      else
-        log "⏭️  PR #${PR_ID} is being processed by PID $_pr_lock_pid (lock age: ${_pr_lock_age}s), skipping"
-        exit 0
-      fi
-    else
-      log "⏭️  PR #${PR_ID} is being processed by PID $_pr_lock_pid (lock age: ${_pr_lock_age}s), skipping"
-      exit 0
-    fi
-  elif [ "${_pr_lock_pid:-0}" -le 0 ] 2>/dev/null && [ "$_pr_lock_age" -lt "$LOCK_ACQUIRE_WINDOW_SECS" ]; then
-    # Lock dir exists but the PID line is empty/0 AND the dir is brand-new: the holder
-    # writes its PID immediately after mkdir (no slow ops between), so a missing PID on
-    # a fresh dir means a concurrent router is inside the sub-second acquisition window —
-    # NOT a dead holder. Treating it as dead (the old `else`) was the TOCTOU that let two
-    # routers both "acquire" the same PR lock (PR #1420: every log line duplicated, both
-    # iteration:0), then race + destroy a shared worktree → exit 128. Yield to the winner.
-    log "⏭️  PR #${PR_ID} lock dir is mid-acquire by another router (no PID yet, age ${_pr_lock_age}s), skipping"
-    exit 0
-  else
-    # PID is gone (dead holder). Reclaim the lock IMMEDIATELY rather than waiting out
-    # an age timer. Liveness (kill -0), not age, is the correct signal.
-    log "🧹 Reclaiming dead-holder PR lock for #${PR_ID} (PID $_pr_lock_pid exited, age: ${_pr_lock_age}s)"
-    rm -f "$PR_LOCK_DIR/pid" 2>/dev/null
-    rmdir "$PR_LOCK_DIR" 2>/dev/null || true
-    mkdir "$PR_LOCK_DIR" 2>/dev/null || { log "⏭️  PR #${PR_ID} lock race — another process won, skipping"; exit 0; }
-  fi
-fi
-# Write timestamp, PID, AND lstart into lock file for liveness + PID-reuse detection
-_pr_self_lstart=$(ps -o lstart= -p $$ 2>/dev/null | xargs) || _pr_self_lstart=""
-printf '%s\n%s\n%s\n' "$(date +%s)" "$$" "$_pr_self_lstart" > "$PR_LOCK_DIR/pid"
-debug "🔒 Acquired PR lock for #${PR_ID} (PID: $$)"
-
-# --- Branch resolution: ensure branch is available locally ---
-# First check local branches/worktrees (fast path for branches we created).
-# If not found locally, fetch from remote — this allows processing Renovate PRs
-# and PRs created by other tools. The lease system prevents duplicate work
-# across machines; local branch affinity is just an optimization, not a gate.
-LOCAL_MATCH=false
-
-# Check local branches (includes branches created by this machine)
-if git -C "$REPO_ROOT" branch --list "$SOURCE_BRANCH" | grep -q .; then
-  LOCAL_MATCH=true
-fi
-
-# Check worktrees (bot's own worktrees for this PR)
-if [ "$LOCAL_MATCH" = false ] && git -C "$REPO_ROOT" worktree list --porcelain 2>/dev/null | grep -q "branch refs/heads/$SOURCE_BRANCH"; then
-  LOCAL_MATCH=true
-fi
-
-# Not found locally — try to fetch from remote and create local tracking branch
-if [ "$LOCAL_MATCH" = false ]; then
-  log "🌐 Branch '${SOURCE_BRANCH}' not found locally, fetching from remote..."
-  local_fetch_err=$(git -C "$REPO_ROOT" fetch origin "$SOURCE_BRANCH" 2>&1) || {
-    log "⏭️  Failed to fetch '${SOURCE_BRANCH}' from remote: $local_fetch_err"
-    exit 0
-  }
-  # Use -f to force-update if a stale local branch already exists
-  local_branch_err=$(git -C "$REPO_ROOT" branch -f "$SOURCE_BRANCH" "origin/$SOURCE_BRANCH" 2>&1) || {
-    log "⏭️  Failed to create local branch '${SOURCE_BRANCH}': $local_branch_err"
-    exit 0
-  }
-  LOCAL_MATCH=true
-  log "✅ Fetched and created local branch '${SOURCE_BRANCH}'"
-fi
-log "✅ Branch '${SOURCE_BRANCH}' available, processing"
-
-# State management
-STATE_FILE="$STATE_DIR/pr-${PR_ID}.json"
-if [ -f "$STATE_FILE" ]; then
-  LAST_COMMIT=$(jq -r '.lastProcessedCommit // ""' "$STATE_FILE")
-else
-  LAST_COMMIT=""
-  echo '{}' > "$STATE_FILE"
-fi
-
-# Dedup: ntfy notification dedup + lease system handles concurrent processing.
-# Comment-ID-based dedup removed — ADO comment IDs are per-thread (not global),
-# so comparing across threads incorrectly skips new comments on different threads.
-
 # ADO API call with exponential backoff retry and full error logging.
 # Usage: ado_api_call <url> [method] [body]
 # Outputs response body on success, returns non-zero on failure.
-ado_api_call() {
+# shellcheck disable=SC2329 # called by pr_event_guard.sh
+ado_api_request() {
   local url="$1"
   local method="${2:-GET}"
   local body="${3:-}"
@@ -531,6 +84,14 @@ ado_api_call() {
   hdrfile=$(mktemp)
 
   while [ "$attempt" -le "$max_retries" ]; do
+    # A delayed mutation retry needs fresh authority too. GETs used by the guard
+    # do not recurse, and the first attempt was checked by the wrapper.
+    if [ "$method" != GET ] && [ "$attempt" -gt 0 ]; then
+      if ! pr_guard_check_write "$@"; then
+        rm -f "$tmpfile" "$hdrfile"
+        return 1
+      fi
+    fi
     local http_code
     if [ -n "$body" ]; then
       http_code=$(curl -s -o "$tmpfile" -D "$hdrfile" -w '%{http_code}' \
@@ -600,8 +161,319 @@ ado_api_call() {
   return 1
 }
 
+# shellcheck source=pr_event_guard.sh disable=SC1091
+source "$SCRIPT_DIR/pr_event_guard.sh"
+ado_api_call() { pr_guard_api_call "$@"; }
+
+PAYLOAD="${1:-}"
+log "📥 Router started (PID: $$) with payload (${#PAYLOAD} bytes)"
+
+# Validate before event fields can enter URLs, locks, queue paths or dedupe state.
+if ! pr_event_valid "$PAYLOAD"; then
+  log "⚠️ Invalid PR event context, skipping"
+  exit 0
+fi
+
+# Event type routing — only handle PR comment events
+EVENT_TYPE=$(echo "$PAYLOAD" | jq -r '.eventType // empty')
+case "$EVENT_TYPE" in
+  ms.vss-code.git-pullrequest-comment-event)
+    ;; # Continue — this is what we handle
+  "")
+    log "⚠️  No eventType in payload, attempting to process as PR comment"
+    ;;
+  *)
+    log "⏭️  Unhandled event type: $EVENT_TYPE, skipping"
+    exit 0
+    ;;
+esac
+
+# Defense-in-depth against the lease-comment self-trigger loop (start.sh filters this
+# at intake; this guards the deferred-queue replay path which re-injects raw payloads
+# that bypass intake). When a router PATCHes its own lease/status comment, ADO emits a
+# comment-edit event with our machine marker in .resource.comment.content. Acting on it
+# would just re-stamp the lease and emit another event — a tight CPU loop. These markers
+# are bot-internal; a human comment never carries them, so bail without dispatching work.
+_ROUTER_COMMENT_CONTENT=$(echo "$PAYLOAD" | jq -r '.resource.comment.content // empty' 2>/dev/null) || true
+case "$_ROUTER_COMMENT_CONTENT" in
+  *pr-bot-lease*|*pr-bot-status*)
+    log "⏭️  Skipping self-authored bot lease/status comment edit (no-op event, prevents self-trigger loop)"
+    exit 0
+    ;;
+esac
+
+# Log payload structure for debugging (keys only, not values which may contain secrets)
+log "📥 Payload keys: $(echo "$PAYLOAD" | jq -r 'keys | join(", ")' 2>/dev/null || echo 'unknown')"
+log "📥 Payload size: ${#PAYLOAD} bytes"
+
+# If the payload is suspiciously small, it's likely not a full ADO webhook — log and bail
+if [ "${#PAYLOAD}" -lt 100 ]; then
+  log "⚠️  Payload too small to be a valid ADO webhook (${#PAYLOAD} bytes), skipping"
+  log "⚠️  Payload keys: $(echo "$PAYLOAD" | jq -r 'keys | join(", ")' 2>/dev/null || echo '[not JSON]')"
+  exit 0
+fi
+
+# Notification replay suppression is a read-only fast path. Do not record a new
+# ID until its repository and PR have passed authenticated validation.
+NOTIFICATION_ID=$(printf '%s' "$PAYLOAD" | jq -r '.notificationId // empty')
+SEEN_NOTIFICATIONS_FILE="$STATE_DIR/seen-notifications.log"
+if [ -n "$NOTIFICATION_ID" ] && grep -qxF "$NOTIFICATION_ID" "$SEEN_NOTIFICATIONS_FILE" 2>/dev/null; then
+  log "⏭️ Skipping duplicate ADO notification: $NOTIFICATION_ID"
+  exit 0
+fi
+_guard_rc=0
+pr_guard_init "$PAYLOAD" || _guard_rc=$?
+case "$_guard_rc" in
+  0) ;;
+  2) log "🤝 Authoritative PR state requests standdown"; exit 0 ;;
+  *) log "⚠️ Event does not have valid configured repository/PR context"; exit 1 ;;
+esac
+HEAD_COMMIT="$PR_GUARD_HEAD"
+if [ -n "$NOTIFICATION_ID" ]; then
+  printf '%s\n' "$NOTIFICATION_ID" >> "$SEEN_NOTIFICATIONS_FILE"
+  if [ "$(wc -l < "$SEEN_NOTIFICATIONS_FILE")" -gt 1200 ]; then
+    tail -1000 "$SEEN_NOTIFICATIONS_FILE" > "${SEEN_NOTIFICATIONS_FILE}.$$" && mv "${SEEN_NOTIFICATIONS_FILE}.$$" "$SEEN_NOTIFICATIONS_FILE"
+  fi
+fi
+log "📋 Processing authenticated PR #${PR_ID} (repo: ${REPO_NAME}, branch: ${SOURCE_BRANCH})"
+
+# --- Per-PR execution lock (EARLY) ---
+# Acquired after read-only authoritative validation, BEFORE lease/worktree writes.
+# This is the primary gate against concurrent processing of the same PR
+# when multiple webhook notifications arrive within seconds of each other.
+# Each notification has a unique notificationId, so notification dedup doesn't help —
+# we need per-PR locking to ensure only one router process does the expensive work.
+CLAUDE_TIMEOUT="${CLAUDE_TIMEOUT:-1800}"
+# Resolve the TARGET repository the bot operates on (creates worktrees in, fetches,
+# pushes). Decoupled from where the harness scripts live so the harness can run from
+# its own checkout while servicing a different repo. Precedence:
+#   1. TARGET_REPO_DIR (explicit config) — the supported production setting.
+#   2. Fallback: git toplevel of the CWD — preserves legacy behavior when the harness
+#      lived inside the same repo it serviced.
+if [ -n "${TARGET_REPO_DIR:-}" ]; then
+  REPO_ROOT=$(git -C "$TARGET_REPO_DIR" rev-parse --show-toplevel 2>/dev/null)
+else
+  REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
+fi
+if [ -z "$REPO_ROOT" ] || [ ! -d "$REPO_ROOT/.git" ]; then
+  log "❌ Cannot determine git repo root (REPO_ROOT='${REPO_ROOT:-}', TARGET_REPO_DIR='${TARGET_REPO_DIR:-}', CWD=$(pwd))"
+  log "❌ Set TARGET_REPO_DIR in config.env to an absolute path of a local clone of the repo to service"
+  exit 1
+fi
+
+# Never apply validated ADO context to a different local repository.
+if ! pr_guard_origin_matches "$REPO_ROOT"; then
+  log "❌ Target origin does not match the configured authenticated repository"
+  exit 1
+fi
+
+# Verify git can authenticate to remote (catches missing credential helper in systemd/launchd)
+if ! git -C "$REPO_ROOT" ls-remote --exit-code origin HEAD >/dev/null 2>&1; then
+  # One-shot self-heal: the monorepo origin may still be SSH while this daemon runs with
+  # no usable SSH agent (the common cause of exit 128 here). When an ADO_PAT is available,
+  # convert origin → HTTPS and wire the PAT credential helper, then retry ONCE. The
+  # converter + its credential helper are snapshotted next to this script by start.sh, so
+  # $SCRIPT_DIR resolves them even though the router runs from the ephemeral snapshot.
+  HEALED=false
+  if [ -n "${ADO_PAT:-}" ] && [ -f "$SCRIPT_DIR/setup-git-credentials.sh" ]; then
+    log "🔧 git ls-remote failed — attempting SSH→HTTPS+PAT self-heal for origin..."
+    # shellcheck source=../setup-git-credentials.sh
+    source "$SCRIPT_DIR/setup-git-credentials.sh"
+    # Capture (don't pipe) the converter's output so `set -o pipefail` can't trip on a
+    # non-zero error count, then mirror each line into the journal for visibility.
+    HEAL_OUTPUT=$(setup_git_credentials "$REPO_ROOT" 2>&1) || true
+    while IFS= read -r _hl; do [ -n "$_hl" ] && log "    $_hl"; done <<< "$HEAL_OUTPUT"
+    if git -C "$REPO_ROOT" ls-remote --exit-code origin HEAD >/dev/null 2>&1; then
+      log "✅ Self-heal succeeded — origin reachable over HTTPS+PAT"
+      HEALED=true
+    fi
+  fi
+  if [ "$HEALED" != true ]; then
+    log "❌ git ls-remote failed — cannot reach origin"
+    log "❌ Run: ./install-service.sh  (auto-configures HTTPS + credential helper)"
+    log "❌ Or:  source '$SCRIPT_DIR/setup-git-credentials.sh' && setup_git_credentials '$REPO_ROOT'"
+    exit 1
+  fi
+fi
+PR_LOCK_DIR="$STATE_DIR/pr-${PR_ID}.lock"
+# A fresh lock dir whose PID line is still empty is a router mid-acquisition, NOT a
+# dead holder — the holder writes its PID immediately after mkdir. Any lock younger
+# than this window with no live PID is treated as "being acquired" (yield), closing
+# the TOCTOU that let two routers co-acquire one PR (see the acquire block below).
+LOCK_ACQUIRE_WINDOW_SECS="${LOCK_ACQUIRE_WINDOW_SECS:-10}"
+# Validate: must be a positive integer in [2, 30]. A value of 0 makes the
+# mid-acquire elif unreachable (re-exposing the TOCTOU); a non-numeric value
+# causes [ -lt ] to error. Clamp to the default on any invalid input.
+case "$LOCK_ACQUIRE_WINDOW_SECS" in
+  ''|*[!0-9]*) LOCK_ACQUIRE_WINDOW_SECS=10 ;;
+esac
+[ "$LOCK_ACQUIRE_WINDOW_SECS" -lt 2 ] 2>/dev/null && LOCK_ACQUIRE_WINDOW_SECS=2
+[ "$LOCK_ACQUIRE_WINDOW_SECS" -gt 30 ] 2>/dev/null && LOCK_ACQUIRE_WINDOW_SECS=30
+
+PR_LOCK_OWNED=false
+cleanup() {
+  local exit_status=$?  # Capture the REAL exit code FIRST — `set +e` is a builtin
+                        # that would reset $? to 0 (the cause of the silent #1340
+                        # loop: crash markers/breaker never saw the true code).
+  # A losing router owns no state/lease/lock and must not clean up the winner.
+  [ "$PR_LOCK_OWNED" = true ] || return 0
+  set +e  # Never let cleanup fail partway through
+  # Write lastexit BEFORE removing inflight breadcrumb (Change 3 + Thread 11785).
+  # An uncatchable SIGKILL between these two ops should leave BOTH artifacts (the
+  # safe direction: reap_jobs sees the inflight breadcrumb + a valid lastexit, giving
+  # it strictly MORE information). The old order (rm inflight first, then write
+  # lastexit) had a gap where a SIGKILL would leave NEITHER: reap_jobs would see
+  # true_rc=0 from `( router || true )` and take the success path — the silent-drop
+  # bug. Writing lastexit first closes that window.
+  if [ -n "${PR_ID:-}" ]; then
+    echo "$exit_status" > "$STATE_DIR/pr-${PR_ID}.lastexit" 2>/dev/null || true
+  fi
+  # NOW remove the in-flight breadcrumb — its absence tells start.sh "cleanup ran".
+  [ -n "${PR_ID:-}" ] && rm -f "$STATE_DIR/pr-${PR_ID}.inflight" 2>/dev/null
+  # Circuit-breaker outcome — ONLY when we actually held the lease and did work
+  # (LEASE_COMMENT_ID set). Pre-lease exits (circuit-open skip, non-active PR,
+  # duplicate, lost race) must NOT touch breaker state, so the breaker self-expires
+  # via nextRetryEpoch and stays the sole retry governor. Best-effort; never fail.
+  # Exit 75 (YIELD) is contention, NOT a defect — it must NOT record a circuit
+  # failure (that would back off a perfectly healthy PR just because a human was
+  # mid-push). It is handled in the dedicated yield block below.
+  if [ -n "${LEASE_COMMENT_ID:-}" ] && [ -n "${PR_ID:-}" ] && [ -n "${HEAD_COMMIT:-}" ] && [ "$exit_status" -ne 75 ]; then
+    if [ "$exit_status" -eq 0 ]; then
+      circuit_record_success "$PR_ID" "$HEAD_COMMIT" 2>/dev/null || true
+    else
+      circuit_record_failure "$PR_ID" "$HEAD_COMMIT" "$exit_status" 2>/dev/null || true
+    fi
+  fi
+  # Release only the held lease; a new opt-out must not leave an active lease.
+  # shellcheck disable=SC2034 # consumed by the guarded API wrapper
+  PR_GUARD_RELEASING_LEASE=1
+  # Release distributed lease (best-effort)
+  if [ -n "${LEASE_THREAD_ID:-}" ]; then
+    if [ "$exit_status" -eq 0 ]; then
+      release_pr_lease "done" "pushed fixes"
+    elif [ "$exit_status" -eq 75 ]; then
+      # YIELD: release as "done" so the lease filter treats it as NON-active. This
+      # release IS the re-dispatch mechanism — pr_heartbeat.sh sees no active lease +
+      # still-actionable work (the unresolved comments/failing build we couldn't push
+      # a fix for) and re-dispatches on its next cycle (~5min), rebuilding a FRESH
+      # payload from the current PR list. We deliberately do NOT drop a deferred
+      # requeue here: that drains every ~60s and would re-invoke Claude (expensive)
+      # far tighter than the intended ~5min yield backoff. "done" (not "failed")
+      # also avoids a scary visible ⚠️ comment for what is benign branch contention.
+      release_pr_lease "done" "yielded (branch contended) — will retry"
+    else
+      release_pr_lease "failed" "exit code $exit_status"
+    fi
+  fi
+  # Write crash marker for recovery on restart. Exit 75 (yield) is NOT a crash —
+  # it self-recovers via the heartbeat (lease released non-active above), so it
+  # gets no marker and no circuit penalty.
+  if [ "$exit_status" -ne 0 ] && [ "$exit_status" -ne 75 ] && [ -n "${PR_ID:-}" ]; then
+    log "💥 PR #${PR_ID} handler crashed (exit code $exit_status)"
+    local crash_record
+    crash_record=$(jq -n --arg pr "${PR_ID}" --arg code "$exit_status" \
+         --arg org "$ADO_ORG" --arg project "$ADO_PROJECT" \
+         --arg host "$(hostname -s 2>/dev/null || echo unknown)" \
+         --arg repo "${REPO_ID:-}" --argjson pid "$$" \
+         --arg source "${PR_GUARD_SOURCE_REF:-}" --arg target "${PR_GUARD_TARGET_REF:-}" \
+         --arg head "${PR_GUARD_HEAD:-}" --argjson crashed "$(date +%s)" \
+         --arg lease_thread "${LEASE_THREAD_ID:-}" --arg lease_comment "${LEASE_COMMENT_ID:-}" \
+         --argjson started "${LEASE_STARTED:-0}" --argjson expires "${LEASE_EXPIRES:-0}" \
+         '{version:2,org:$org,project:$project,pr:$pr,exitCode:$code,host:$host,repoId:$repo,pid:$pid,
+           sourceRef:$source,targetRef:$target,head:$head,crashedAt:$crashed,
+           leaseThreadId:$lease_thread,leaseCommentId:$lease_comment,
+           leaseStarted:$started,leaseExpires:$expires}') || crash_record=""
+    if ! pr_crash_state_publish "$STATE_DIR/pr-${PR_ID}.crashed" "$crash_record"; then
+      log "⚠️ Crash record publication failed or deferred for PR #${PR_ID}; inspect pending state"
+    fi
+  fi
+  # Clean up worktree when done (branch persists in the repo).
+  # $WORK_DIR is keyed on PR id AND this router's PID ($WORKTREE_DIR/pr-<ID>-<PID>),
+  # so it is unique to THIS run — no sibling router can be inside it, and our rm -rf
+  # can only ever delete our own directory. (Pre-PID, the path was shared per-PR and
+  # a sibling's cleanup could yank the dir out from under a live router → exit 128.)
+  if [ -n "${WORK_DIR:-}" ] && [ -d "$WORK_DIR" ]; then
+    log "🧹 Removing worktree for PR #${PR_ID} (normal exit cleanup)..."
+    git -C "$REPO_ROOT" worktree remove --force "$WORK_DIR" 2>/dev/null || true
+    rm -rf "$WORK_DIR" 2>/dev/null || true
+    git -C "$REPO_ROOT" worktree prune 2>/dev/null || true
+  fi
+  # Release per-PR execution lock
+  if [ "$(sed -n '2p' "$PR_LOCK_DIR/pid" 2>/dev/null)" = "$$" ]; then
+    rm -f "$PR_LOCK_DIR/pid" 2>/dev/null
+    rmdir "$PR_LOCK_DIR" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
+if ! mkdir "$PR_LOCK_DIR" 2>/dev/null; then
+  # Lock exists — check if the holding process is still alive before declaring stale
+  _pr_lock_ts=$(head -1 "$PR_LOCK_DIR/pid" 2>/dev/null || echo 0)
+  _pr_lock_pid=$(sed -n '2p' "$PR_LOCK_DIR/pid" 2>/dev/null || echo 0)
+  _pr_lock_lstart=$(sed -n '3p' "$PR_LOCK_DIR/pid" 2>/dev/null || echo "")
+  _pr_lock_age=$(( $(date +%s) - _pr_lock_ts ))
+
+  if [ "$_pr_lock_pid" -gt 0 ] 2>/dev/null && kill -0 "$_pr_lock_pid" 2>/dev/null; then
+    # PID alive — check lstart for PID reuse, consistent with pr_lease.sh pattern.
+    # If lstart was recorded and differs from current, the PID was recycled → reclaim.
+    # If no lstart recorded (old lock file format), safe direction: treat as held.
+    if [ -n "$_pr_lock_lstart" ]; then
+      _pr_current_lstart=$(ps -o lstart= -p "$_pr_lock_pid" 2>/dev/null | xargs) || _pr_current_lstart=""
+      if [ -n "$_pr_current_lstart" ] && [ "$_pr_lock_lstart" != "$_pr_current_lstart" ]; then
+        log "🧹 Reclaiming PR lock for #${PR_ID} (PID $_pr_lock_pid recycled: lstart='${_pr_current_lstart}' != recorded='${_pr_lock_lstart}')"
+        rm -f "$PR_LOCK_DIR/pid" 2>/dev/null
+        rmdir "$PR_LOCK_DIR" 2>/dev/null || true
+        mkdir "$PR_LOCK_DIR" 2>/dev/null || { log "⏭️  PR #${PR_ID} lock race — another process won, skipping"; exit 0; }
+      else
+        log "⏭️  PR #${PR_ID} is being processed by PID $_pr_lock_pid (lock age: ${_pr_lock_age}s), skipping"
+        exit 0
+      fi
+    else
+      log "⏭️  PR #${PR_ID} is being processed by PID $_pr_lock_pid (lock age: ${_pr_lock_age}s), skipping"
+      exit 0
+    fi
+  elif [ "${_pr_lock_pid:-0}" -le 0 ] 2>/dev/null && [ "$_pr_lock_age" -lt "$LOCK_ACQUIRE_WINDOW_SECS" ]; then
+    # Lock dir exists but the PID line is empty/0 AND the dir is brand-new: the holder
+    # writes its PID immediately after mkdir (no slow ops between), so a missing PID on
+    # a fresh dir means a concurrent router is inside the sub-second acquisition window —
+    # NOT a dead holder. Treating it as dead (the old `else`) was the TOCTOU that let two
+    # routers both "acquire" the same PR lock (PR #1420: every log line duplicated, both
+    # iteration:0), then race + destroy a shared worktree → exit 128. Yield to the winner.
+    log "⏭️  PR #${PR_ID} lock dir is mid-acquire by another router (no PID yet, age ${_pr_lock_age}s), skipping"
+    exit 0
+  else
+    # PID is gone (dead holder). Reclaim the lock IMMEDIATELY rather than waiting out
+    # an age timer. Liveness (kill -0), not age, is the correct signal.
+    log "🧹 Reclaiming dead-holder PR lock for #${PR_ID} (PID $_pr_lock_pid exited, age: ${_pr_lock_age}s)"
+    rm -f "$PR_LOCK_DIR/pid" 2>/dev/null
+    rmdir "$PR_LOCK_DIR" 2>/dev/null || true
+    mkdir "$PR_LOCK_DIR" 2>/dev/null || { log "⏭️  PR #${PR_ID} lock race — another process won, skipping"; exit 0; }
+  fi
+fi
+# Write timestamp, PID, AND lstart into lock file for liveness + PID-reuse detection
+_pr_self_lstart=$(ps -o lstart= -p $$ 2>/dev/null | xargs) || _pr_self_lstart=""
+printf '%s\n%s\n%s\n' "$(date +%s)" "$$" "$_pr_self_lstart" > "$PR_LOCK_DIR/pid"
+debug "🔒 Acquired PR lock for #${PR_ID} (PID: $$)"
+PR_LOCK_OWNED=true
+# Only the lock owner may create/remove this shared processing breadcrumb.
+INFLIGHT_FILE="$STATE_DIR/pr-${PR_ID}.inflight"
+: > "$INFLIGHT_FILE" 2>/dev/null || true
+
+
+# State management
+STATE_FILE="$STATE_DIR/pr-${PR_ID}.json"
+if [ -f "$STATE_FILE" ]; then
+  LAST_COMMIT=$(jq -r '.lastProcessedCommit // ""' "$STATE_FILE")
+else
+  LAST_COMMIT=""
+  echo '{}' > "$STATE_FILE"
+fi
+
+# Dedup: ntfy notification dedup + lease system handles concurrent processing.
+# Comment-ID-based dedup removed — ADO comment IDs are per-thread (not global),
+# so comparing across threads incorrectly skips new comments on different threads.
+
 # Fetch unresolved PR threads from ADO REST API (for thread ID tracking + resolution)
-ADO_BASE="https://dev.azure.com/${ADO_ORG}/${ADO_PROJECT}/_apis"
+# ADO_BASE and repository identity were pinned by pr_guard_init.
 
 # --- Distributed lease via ADO PR comment ---
 # Source lease functions (requires ado_api_call, ADO_BASE, log — all defined above)
@@ -618,14 +490,6 @@ source "$SCRIPT_DIR/pr_constants.sh"
 # empty here, so the EXIT trap writes NO failed lease and NO .crashed marker —
 # the breaker (which self-expires via nextRetryEpoch) is the sole retry governor.
 # A new commit (different SHA) resets the breaker → fresh code gets a fresh try.
-# Fall back to PR_DETAILS API for the head commit if the webhook payload lacked it.
-_bk_pr_details=""
-if [ -z "${HEAD_COMMIT:-}" ] && [ -n "$REPO_ID" ]; then
-  _bk_pr_details=$(ado_api_call "${ADO_BASE}/git/repositories/${REPO_ID}/pullRequests/${PR_ID}?api-version=7.1" 2>/dev/null) || true
-  if [ -n "$_bk_pr_details" ]; then
-    HEAD_COMMIT=$(echo "$_bk_pr_details" | jq -r '.lastMergeSourceCommit.commitId // empty' 2>/dev/null) || true
-  fi
-fi
 if circuit_is_open "$PR_ID" "${HEAD_COMMIT:-}"; then
   if [ "$CIRCUIT_STATE" = "quarantined" ]; then
     log "🚦 Circuit QUARANTINED for #${PR_ID} on ${HEAD_COMMIT:0:8} (retry in ${CIRCUIT_RETRY_IN}s) — push a new commit to clear"
@@ -635,39 +499,8 @@ if circuit_is_open "$PR_ID" "${HEAD_COMMIT:-}"; then
   exit 0
 fi
 
-# --- Authoritative [no-bot] recheck (safety net for comment webhooks) ---
-# The EARLY payload check (top of file) can miss [no-bot] when a comment-event
-# payload omits the PR title/description. Now — still BEFORE lease acquisition and
-# worktree creation (the destructive ops: reset --hard / force-push) — confirm
-# against the PR details API, but ONLY when the payload lacked both title and
-# description (otherwise the early check already covered it). Reuse the circuit
-# gate's fetch if it happened; else do one lightweight fetch. Bail clean: exit 0
-# with no lease and no worktree; cleanup() only releases the cheap local lock
-# (LEASE_*/HEAD-marker untouched), so there is no circuit penalty or .crashed.
-if [ -z "${PAYLOAD_PR_TITLE:-}" ] && [ -z "${PAYLOAD_PR_DESC:-}" ]; then
-  _nb_details="${_bk_pr_details:-}"
-  if [ -z "$_nb_details" ] && [ -n "$REPO_ID" ]; then
-    _nb_details=$(ado_api_call "${ADO_BASE}/git/repositories/${REPO_ID}/pullRequests/${PR_ID}?api-version=7.1" 2>/dev/null) || true
-  fi
-  if [ -n "$_nb_details" ]; then
-    _nb_title=$(echo "$_nb_details" | jq -r '.title // ""' 2>/dev/null) || true
-    _nb_desc=$(echo "$_nb_details" | jq -r '.description // ""' 2>/dev/null) || true
-    if pr_text_has_directive "$(printf '%s\n%s' "$_nb_title" "$_nb_desc")" "no-bot"; then
-      log "🤝 PR #${PR_ID} tagged [no-bot] (confirmed via PR details) — standing down, no lease/worktree/push"
-      exit 0
-    fi
-    # Same authoritative source refines [no-auto] (payload lacked title/body above).
-    # Lenient substring match, mirroring the early check (see rationale there).
-    if [ "${SKIP_AUTO:-0}" != "1" ] && printf '%s\n%s' "$_nb_title" "$_nb_desc" | grep -qiE '\[no-auto\]'; then
-      SKIP_AUTO=1
-      log "⏸️  PR #${PR_ID} tagged [no-auto] (confirmed via PR details) — auto-approve/complete disabled"
-    fi
-    if [ "${RISK_OVERRIDE:-0}" != "1" ] && pr_text_has_directive "$_nb_title" "risk-approved"; then
-      RISK_OVERRIDE=1
-      log "⚠️  PR #${PR_ID} tagged [risk-approved] (confirmed via PR details) — explicit HIGH-risk acceptance detected"
-    fi
-  fi
-fi
+# Recheck after local setup and before touching the distributed lease.
+pr_guard_require
 
 # PR_THREADS_JSON is set by check_pr_lease for downstream reuse
 PR_THREADS_JSON=""
@@ -698,11 +531,49 @@ if check_pr_lease "$PR_ID" "$REPO_ID"; then
   fi
   exit 0
 fi
+pr_guard_require
 if ! acquire_pr_lease "$PR_ID" "$REPO_ID"; then
   log "⏭️  PR #${PR_ID} lease acquisition failed (race or API error), skipping"
   exit 0
 fi
 LEASE_EXPIRES=$(($(date +%s) + ${CLAUDE_TIMEOUT:-1800}))
+
+pr_guard_require
+# --- Branch resolution: ensure branch is available locally ---
+# First check local branches/worktrees (fast path for branches we created).
+# If not found locally, fetch from remote — this allows processing Renovate PRs
+# and PRs created by other tools. The lease system prevents duplicate work
+# across machines; local branch affinity is just an optimization, not a gate.
+LOCAL_MATCH=false
+
+# Check local branches (includes branches created by this machine)
+if git -C "$REPO_ROOT" branch --list "$SOURCE_BRANCH" | grep -q .; then
+  LOCAL_MATCH=true
+fi
+
+# Check worktrees (bot's own worktrees for this PR)
+if [ "$LOCAL_MATCH" = false ] && git -C "$REPO_ROOT" worktree list --porcelain 2>/dev/null | grep -q "branch refs/heads/$SOURCE_BRANCH"; then
+  LOCAL_MATCH=true
+fi
+
+# Not found locally — try to fetch from remote and create local tracking branch
+if [ "$LOCAL_MATCH" = false ]; then
+  log "🌐 Branch '${SOURCE_BRANCH}' not found locally, fetching from remote..."
+  local_fetch_err=$(git -C "$REPO_ROOT" fetch origin "$SOURCE_BRANCH" 2>&1) || {
+    log "⏭️  Failed to fetch '${SOURCE_BRANCH}' from remote: $local_fetch_err"
+    exit 0
+  }
+  # Use -f to force-update if a stale local branch already exists
+  local_branch_err=$(git -C "$REPO_ROOT" branch -f "$SOURCE_BRANCH" "origin/$SOURCE_BRANCH" 2>&1) || {
+    log "⏭️  Failed to create local branch '${SOURCE_BRANCH}': $local_branch_err"
+    exit 0
+  }
+  LOCAL_MATCH=true
+  log "✅ Fetched and created local branch '${SOURCE_BRANCH}'"
+fi
+log "✅ Branch '${SOURCE_BRANCH}' available, processing"
+
+
 
 log "🔍 Fetching active PR threads..."
 THREADS_URL="${ADO_BASE}/git/repositories/${REPO_ID}/pullRequests/${PR_ID}/threads?api-version=7.1"
@@ -770,16 +641,7 @@ THREAD_IDS=$(echo "$UNRESOLVED_COMMENTS" | jq -r '[.[].threadId] | join(",")' 2>
 # Check policies BEFORE worktree creation so we can skip work when
 # there are no comments AND no failing builds.
 BUILD_FAILURE_CONTEXT=""
-PROJECT_ID=$(echo "$PAYLOAD" | jq -r '.resource.pullRequest.repository.project.id // empty' 2>/dev/null) || true
-if [ -z "$PROJECT_ID" ]; then
-  # Fetch from PR details API
-  PR_DETAILS_URL="${ADO_BASE}/git/repositories/${REPO_ID}/pullRequests/${PR_ID}?api-version=7.1"
-  PR_DETAILS=$(ado_api_call "$PR_DETAILS_URL" 2>/dev/null) || true
-  PROJECT_ID=$(echo "$PR_DETAILS" | jq -r '.repository.project.id // empty' 2>/dev/null)
-fi
-if [ -z "$PROJECT_ID" ]; then
-  PROJECT_ID="$ADO_PROJECT"
-fi
+# PROJECT_ID comes only from the authenticated configured repository.
 POLICY_EVAL_URL="${ADO_BASE}/policy/evaluations?artifactId=$(printf '%s' "vstfs:///CodeReview/CodeReviewId/${PROJECT_ID}/${PR_ID}" | jq -sRr @uri)&api-version=7.1-preview"
 POLICY_EVALS=$(ado_api_call "$POLICY_EVAL_URL" 2>/dev/null) || true
 HAS_FAILING_BUILD=false
@@ -930,27 +792,9 @@ set -e
 # Re-arm the global ERR trap disarmed at the top of this block.
 arm_err_trap
 
-# Ensure PR has a linked work item before any early-exit (ADO branch policy requires it)
-# Must run even if there's nothing else to do, since the PR may have been created without one.
-# Fetch PR_DETAILS if not already available (it's only set when PROJECT_ID was missing from payload)
-if [ -z "${PR_DETAILS:-}" ]; then
-  PR_DETAILS=$(ado_api_call "${ADO_BASE}/git/repositories/${REPO_ID}/pullRequests/${PR_ID}?api-version=7.1" 2>/dev/null) || true
-fi
-if [ -n "${PR_DETAILS:-}" ]; then
-  # Skip work item linking for abandoned/completed PRs (prevents webhook feedback loops)
-  PR_STATUS_NUM=$(echo "$PR_DETAILS" | jq -r '.status // 1' 2>/dev/null)
-  if [ "$PR_STATUS_NUM" = "1" ] || [ "$PR_STATUS_NUM" = "active" ]; then
-    ensure_pr_work_item "$PR_ID" "$REPO_ID" "$PR_DETAILS"
-  else
-    log "⏭️  Skipping work item linkage for non-active PR #${PR_ID} (status: ${PR_STATUS_NUM})"
-  fi
-fi
-
-# Bail out entirely for abandoned/completed PRs — nothing to do
-if [ -n "${PR_STATUS_NUM:-}" ] && [ "$PR_STATUS_NUM" != "1" ] && [ "$PR_STATUS_NUM" != "active" ]; then
-  log "⏭️  PR #${PR_ID} is not active (status: ${PR_STATUS_NUM}), skipping"
-  exit 0
-fi
+# Refresh before work-item mutations; helper API writes recheck again.
+pr_guard_require
+ensure_pr_work_item "$PR_ID" "$REPO_ID" "$PR_DETAILS"
 
 # --- Merge conflict detection via ADO API ---
 HAS_MERGE_CONFLICT=false
@@ -1024,13 +868,14 @@ if [ "$HAS_UNRESOLVED_COMMENTS" = false ] && [ "$HAS_FAILING_BUILD" = false ] &&
   elif [ -z "${SOURCE_BRANCH:-}" ]; then
     log "⚠️  No source branch resolved — cannot stage risk worktree; skipping merge-only gate"
   else
+    pr_guard_require
     WORK_DIR="$WORKTREE_DIR/pr-${PR_ID}-$$"
     if [ -d "$WORK_DIR" ]; then
       git -C "$REPO_ROOT" worktree remove --force "$WORK_DIR" 2>/dev/null || true
       rm -rf "$WORK_DIR"
       git -C "$REPO_ROOT" worktree prune 2>/dev/null || true
     fi
-    git -C "$REPO_ROOT" -c gc.auto=0 fetch origin main "$SOURCE_BRANCH" 2>/dev/null || true
+    git -C "$REPO_ROOT" -c gc.auto=0 fetch origin main "$SOURCE_BRANCH" 2>/dev/null || exit 1
     if git -C "$REPO_ROOT" worktree add --detach "$WORK_DIR" "origin/$SOURCE_BRANCH" 2>/dev/null; then
       if [ -n "$ALREADY_ARMED" ]; then
         log "🔐 Auto-complete is armed but a blocking review policy is unapproved — recovering approval"
@@ -1046,6 +891,8 @@ if [ "$HAS_UNRESOLVED_COMMENTS" = false ] && [ "$HAS_FAILING_BUILD" = false ] &&
   log "✅ No unresolved comments and all policies passing — nothing else to do"
   exit 0
 fi
+
+pr_guard_require
 
 # Use git worktree for full isolation — each PR gets its own working directory
 # so multiple PRs can be processed in parallel without checkout races.
@@ -1070,9 +917,10 @@ fi
 
 log "🌿 Creating worktree for PR #${PR_ID} at ${WORK_DIR}..."
 log "🌿 Fetching main + source branch: ${SOURCE_BRANCH}..."
-git -C "$REPO_ROOT" -c gc.auto=0 fetch origin main 2>&1 || log "⚠️  git fetch main failed"
+git -C "$REPO_ROOT" -c gc.auto=0 fetch origin main 2>&1 || exit 1
 if ! git -C "$REPO_ROOT" -c gc.auto=0 fetch origin "$SOURCE_BRANCH" 2>&1; then
   log "⚠️  git fetch failed for branch ${SOURCE_BRANCH} (may not exist on remote)"
+  exit 1
 fi
 
 # Create worktree in detached HEAD mode, then checkout the branch.
@@ -1122,8 +970,9 @@ if [ -n "$REMOTE_HEAD" ] && [ "$REMOTE_HEAD" != "$LOCAL_HEAD" ]; then
   git -C "$WORK_DIR" reset --hard "origin/$SOURCE_BRANCH" 2>&1
 fi
 
-# WU11: Re-fetch PR details (may have changed since early check) for Claude prompt context
-PR_DETAILS=$(ado_api_call "${ADO_BASE}/git/repositories/${REPO_ID}/pullRequests/${PR_ID}?api-version=7.1") || true
+# Bind the worktree snapshot to authoritative PR source before the model starts.
+pr_guard_require "$(git -C "$WORK_DIR" rev-parse HEAD)"
+PUSH_LEASE_HEAD="$PR_GUARD_HEAD"
 
 # Build policy context already fetched above (early policy check).
 # Adjust Claude prompt based on what we're asking it to do.
@@ -1183,7 +1032,7 @@ else
 fi
 
 # Invoke Claude Code with --from-pr for full PR context (diff, comments, metadata)
-PR_URL="https://dev.azure.com/${ADO_ORG}/${ADO_PROJECT}/_git/${REPO_NAME}/pullrequest/${PR_ID}"
+PR_URL="${ADO_BASE%/_apis}/_git/${REPO_ID}/pullrequest/${PR_ID}"
 log "🤖 Invoking: claude --from-pr ${PR_URL}"
 
 # Pre-flight: verify Claude CLI is working before committing to a long timeout
@@ -1295,6 +1144,7 @@ while [ "$ATTEMPT" -le "$CLAUDE_MAX_RETRIES" ]; do
     log "🔄 Retry attempt $ATTEMPT/$((CLAUDE_MAX_RETRIES + 1)) — continuing from previous session"
   fi
 
+  pr_guard_require
   run_claude_session "$CURRENT_PROMPT" "$CONTINUE_SESSION"
 
   if [ "$CLAUDE_EXIT_CODE" -eq 124 ]; then
@@ -1423,15 +1273,18 @@ elif jq -e '.type == "result"' "$CLAUDE_STDOUT_FILE" >/dev/null 2>&1; then
       log "    $(echo "$UNCOMMITTED_CHANGES" | head -3)"
     fi
 
-    # 2. Check for unpushed commits (fetch first to ensure remote refs are current)
+    # 2. Recheck before recovery work; a model session may have run for minutes.
+    pr_guard_require
+    # Check for unpushed commits (fetch first to ensure remote refs are current)
     git -C "$WORK_DIR" fetch origin "$SOURCE_BRANCH" 2>/dev/null || true
     UNPUSHED=$(git -C "$WORK_DIR" log "origin/${SOURCE_BRANCH}..HEAD" --oneline 2>/dev/null || true)
     if [ -n "$UNPUSHED" ]; then
       UNPUSHED_COUNT=$(echo "$UNPUSHED" | wc -l | tr -d ' ')
       log "⚠️  Found $UNPUSHED_COUNT unpushed commit(s), attempting recovery push (--force-with-lease)..."
       # Push safety under concurrency: use --force-with-lease so we only overwrite
-      # the remote ref if it still points where our fetch saw it. If a human or an
-      # interactive agent pushed in the meantime, the lease is stale and git rejects
+      # the remote ref if it still points at the authoritative pre-session head.
+      # A verification fetch must NOT silently refresh that expected old value.
+      # If a human or an interactive agent pushed in the meantime, the lease is stale and git rejects
       # the push instead of clobbering their commit. On rejection we fetch + rebase
       # our commits on top of theirs and retry, up to PR_BOT_PUSH_RETRIES times. If
       # it is STILL contended after the budget, we YIELD (exit 75) rather than crash:
@@ -1442,8 +1295,13 @@ elif jq -e '.type == "result"' "$CLAUDE_STDOUT_FILE" >/dev/null 2>&1; then
       _push_is_concurrency=false
       _attempt=0
       while :; do
+        pr_guard_require
+        if ! pr_guard_origin_matches "$WORK_DIR"; then
+          log "❌ Effective origin push destination changed; aborting recovery"
+          exit 1
+        fi
         _push_stderr=$(mktemp)
-        if git -C "$WORK_DIR" push --force-with-lease origin HEAD:"refs/heads/${SOURCE_BRANCH}" 2>"$_push_stderr"; then
+        if git -C "$WORK_DIR" push "--force-with-lease=refs/heads/${SOURCE_BRANCH}:${PUSH_LEASE_HEAD}" origin HEAD:"refs/heads/${SOURCE_BRANCH}" 2>"$_push_stderr"; then
           log "✅ Recovery push succeeded"
           _push_ok=true
           rm -f "$_push_stderr"
@@ -1470,12 +1328,21 @@ elif jq -e '.type == "result"' "$CLAUDE_STDOUT_FILE" >/dev/null 2>&1; then
           break
         fi
         log "↩️  Recovery push rejected (lease stale — concurrent push), rebasing and retrying (${_attempt}/${PR_BOT_PUSH_RETRIES})..."
-        git -C "$WORK_DIR" fetch origin "$SOURCE_BRANCH" 2>/dev/null || true
-        if ! git -C "$WORK_DIR" rebase "origin/${SOURCE_BRANCH}" 2>&1; then
-          log "⚠️  Rebase onto origin/${SOURCE_BRANCH} hit conflicts — aborting rebase, will yield"
+        if ! git -C "$WORK_DIR" fetch origin "$SOURCE_BRANCH" 2>/dev/null; then
+          _push_is_concurrency=false
+          break
+        fi
+        _retry_head=$(git -C "$WORK_DIR" rev-parse "origin/${SOURCE_BRANCH}") || { _push_is_concurrency=false; break; }
+        pr_guard_require
+        # Remote-tracking refs are shared by linked worktrees. Rebase the captured
+        # SHA, not origin/<branch>, which another fetch can move during the check.
+        if ! git -C "$WORK_DIR" rebase "$_retry_head" 2>&1; then
+          log "⚠️  Rebase onto ${_retry_head} hit conflicts — aborting rebase, will yield"
           git -C "$WORK_DIR" rebase --abort 2>/dev/null || true
           break
         fi
+        # Advance the explicit lease only after rebasing onto that fetched tip.
+        PUSH_LEASE_HEAD="$_retry_head"
       done
       if [ "$_push_ok" != true ]; then
         if [ "$_push_is_concurrency" = true ]; then
@@ -1549,7 +1416,13 @@ fi
 # Resolve threads if Claude successfully addressed them
 if [ "$CLAUDE_SUCCESS" = true ] && [ -n "$THREAD_IDS" ]; then
   log "🔒 Resolving addressed threads..."
-  "$SCRIPT_DIR/ado_resolve.sh" "$PR_ID" "$REPO_ID" "$THREAD_IDS"
+  # Resolve through the guarded transport, one fresh check per mutation.
+  IFS=',' read -ra _resolve_ids <<< "$THREAD_IDS"
+  for _resolve_id in "${_resolve_ids[@]}"; do
+    [[ "$_resolve_id" =~ ^[1-9][0-9]*$ ]] || continue
+    pr_guard_require
+    ado_api_call "${ADO_BASE}/git/repositories/${REPO_ID}/pullRequests/${PR_ID}/threads/${_resolve_id}?api-version=7.1" "PATCH" '{"status":"fixed"}' >/dev/null || true
+  done
 elif [ -n "$THREAD_IDS" ]; then
   log "⚠️  Skipping thread resolution — Claude did not confirm successful changes"
 fi
