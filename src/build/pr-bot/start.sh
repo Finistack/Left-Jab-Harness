@@ -300,6 +300,8 @@ fi
 chmod +x "$SNAPSHOT_DIR"/*.sh
 # Redirect SCRIPT_DIR for all dispatched routers to use the snapshot
 RUNTIME_SCRIPT_DIR="$SNAPSHOT_DIR"
+# shellcheck source=pr_event_guard.sh disable=SC1091
+source "$RUNTIME_SCRIPT_DIR/pr_event_guard.sh"
 
 PID_FILE="$STATE_DIR/daemon.pid"
 LOG_FILE="$STATE_DIR/daemon.log"
@@ -661,6 +663,12 @@ reap_jobs() {
           rm -f "$STATE_DIR/pr-${pr_id}.inflight" 2>/dev/null || true
           [ "$true_rc" -eq 0 ] && true_rc=137  # SIGKILL — cleanup() demonstrably did not run
         fi
+        # The watchdog decision wins even if the router's TERM trap wrote success.
+        local watchdog_file="$STATE_DIR/pr-${pr_id}.watchdog-${pid}.lastexit"
+        if [ -f "$watchdog_file" ]; then
+          true_rc=137
+          rm -f "$watchdog_file" 2>/dev/null || true
+        fi
       fi
       if [ "$true_rc" -eq 75 ]; then
         # EX_TEMPFAIL — the router YIELDED (lost a push race to a concurrent human/
@@ -904,6 +912,11 @@ kill_oversized_claudes() {
     fi
     if [ "$rss_mb" -gt "$limit_mb" ]; then
       echo "[$(date '+%H:%M:%S')] 🛑 Killing PR handler $pid subtree (RSS: ${rss_mb}MB > ${limit_mb}MB per-session limit, PR #${PR_DISPATCH_ID[$pid]:-unknown})"
+      # A TERM cleanup can report zero; retain our forced outcome independently.
+      local watchdog_pr="${PR_DISPATCH_ID[$pid]:-}"
+      if [[ "$watchdog_pr" =~ ^[0-9]+$ ]]; then
+        printf '137\n' > "$STATE_DIR/pr-${watchdog_pr}.watchdog-${pid}.lastexit"
+      fi
       _kill_subtree "$pid" 5
     fi
   done
@@ -1029,7 +1042,9 @@ reap_orphaned_subprocesses() {
 # Defer a message to the queue directory for later retry
 defer_message() {
   local msg_body="$1"
-  local pr_id="${2:-unknown}"
+  pr_event_valid "$msg_body" || return 0
+  local pr_id
+  pr_id=$(printf '%s' "$msg_body" | jq -r '.resource.pullRequest.pullRequestId')
   local defer_file="${DEFER_QUEUE_DIR}/pr-${pr_id}-$(date +%s).json"
   echo "$msg_body" > "$defer_file"
   echo "[$(date '+%H:%M:%S')] 📥 Deferred PR #${pr_id} to queue ($(ls "$DEFER_QUEUE_DIR"/*.json 2>/dev/null | wc -l) queued)"
@@ -1067,6 +1082,10 @@ drain_deferred_queue() {
     fi
     local deferred_body
     deferred_body=$(cat "$qfile")
+    if ! pr_event_valid "$deferred_body"; then
+      rm -f "$qfile"
+      continue
+    fi
     rm -f "$qfile"
     echo "[$(date '+%H:%M:%S')] 📤 Draining deferred PR from queue..."
     ( "$RUNTIME_SCRIPT_DIR/pr_router.sh" "$deferred_body" || true ) &
@@ -1133,8 +1152,8 @@ periodic_health_check() {
   auth_header=$(get_ado_auth_header_cached 2>/dev/null) || auth_header="Basic $(echo -n ":${ADO_PAT:-}" | base64 | tr -d '\n')"
   local ado_code
   ado_code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
-    -H "Authorization: $auth_header" \
-    "https://dev.azure.com/${ADO_ORG}/_apis/projects?api-version=7.1" 2>/dev/null) || ado_code="000"
+    -H @- \
+    "https://dev.azure.com/${ADO_ORG}/_apis/projects?api-version=7.1" <<< "Authorization: $auth_header" 2>/dev/null) || ado_code="000"
   if [[ "$ado_code" =~ ^(401|403)$ ]]; then
     PAT_FAILURE_COUNT=$((PAT_FAILURE_COUNT + 1))
     echo "[$(date '+%H:%M:%S')] ❌ ADO PAT check failed (HTTP $ado_code) — consecutive failures: $PAT_FAILURE_COUNT"
@@ -1207,150 +1226,142 @@ periodic_health_check() {
 # --- Crash recovery: detect .crashed files from previous runs ---
 # Posts a notice on the PR and cleans up, running in background so it
 # doesn't block the ntfy subscribe loop.
-recover_crashed_prs() {
-  # Reentrancy guard (Change 4): startup recovery and the periodic re-run can
-  # overlap, so allow only one pass at a time via a lock dir. Mirrors the per-PR
-  # .lock idiom (start.sh dispatch path): the lock dir holds a `pid` file
-  # (`timestamp\n$$`), and a lock whose holder PID is dead (per `kill -0`) is
-  # reclaimed. PID-liveness — not a fixed age — avoids both false "stale"
-  # reclaims during a long legitimate pass and indefinite hangs after a kill.
-  local _recover_lock="$STATE_DIR/.recover.lock"
-  if ! mkdir "$_recover_lock" 2>/dev/null; then
-    local _rl_pid
-    _rl_pid=$(sed -n '2p' "$_recover_lock/pid" 2>/dev/null || echo 0)
-    if [ "${_rl_pid:-0}" -gt 0 ] 2>/dev/null && kill -0 "$_rl_pid" 2>/dev/null; then
-      return  # Another recovery pass is active
-    fi
-    echo "[$(date '+%H:%M:%S')] 🔧 Reclaiming stale recovery lock (holder PID ${_rl_pid:-0} dead)"
-    rm -f "$_recover_lock/pid" 2>/dev/null
-    rmdir "$_recover_lock" 2>/dev/null || true
-    mkdir "$_recover_lock" 2>/dev/null || return
+# HTTP errors never authorize recovery. No transport retries: every new mutation
+# attempt must first repeat the authoritative checks below.
+pr_recovery_request() {
+  local url="$1" method="${2:-GET}" body="${3:-}" auth
+  auth=$(get_ado_auth_header_cached 2>/dev/null) || return 1
+  # Keep bearer/PAT material off process argv; curl reads the header from stdin.
+  [[ "$auth" != *$'\n'* && "$auth" != *$'\r'* ]] || return 1
+  local -a args=(-fsS --max-time 15 -H @-)
+  if [ "$method" != GET ]; then
+    args+=(-X "$method" -H 'Content-Type: application/json' -d "$body")
   fi
-  printf '%s\n%s\n' "$(date +%s)" "$$" > "$_recover_lock/pid" 2>/dev/null || true
-  # NOTE: release the lock EXPLICITLY at every return point below — do NOT use a
-  # `trap ... RETURN` here. This function `source`s files (ado_auth.sh) mid-pass,
-  # and a bash RETURN trap fires on each sourced-file completion, which would
-  # release the lock before the pass finishes (defeating the reentrancy guard).
-
-  local crashed_files
-  crashed_files=$(ls "$STATE_DIR"/pr-*.crashed 2>/dev/null) || true
-  if [ -z "$crashed_files" ]; then
-    rm -f "$_recover_lock/pid" 2>/dev/null; rmdir "$_recover_lock" 2>/dev/null || true
-    return
-  fi
-
-  echo "[$(date '+%H:%M:%S')] 🔧 Found crashed PR markers, starting recovery..."
-
-  for crash_file in $crashed_files; do
-    [ -f "$crash_file" ] || continue
-
-    local crash_info
-    crash_info=$(cat "$crash_file" 2>/dev/null) || { rm -f "$crash_file"; continue; }
-
-    local cr_pr cr_code cr_ts cr_host cr_repo cr_lease_thread cr_lease_comment cr_lease_expires
-    # GUARD: a crash-file truncated mid-write (the host died while writing it) is not valid
-    # JSON, so jq exits 5. A separate-line `VAR=$(...)` is still subject to `set -e` (only an
-    # inline `local VAR=$(...)` would mask it), so each needs an explicit `|| VAR=default`.
-    cr_pr=$(echo "$crash_info" | jq -r '.pr // empty' 2>/dev/null) || cr_pr=""
-    cr_code=$(echo "$crash_info" | jq -r '.exitCode // "unknown"' 2>/dev/null) || cr_code="unknown"
-    cr_ts=$(echo "$crash_info" | jq -r '.timestamp // "unknown"' 2>/dev/null) || cr_ts="unknown"
-    cr_host=$(echo "$crash_info" | jq -r '.host // "unknown"' 2>/dev/null) || cr_host="unknown"
-    cr_repo=$(echo "$crash_info" | jq -r '.repoId // empty' 2>/dev/null) || cr_repo=""
-    cr_lease_thread=$(echo "$crash_info" | jq -r '.leaseThreadId // empty' 2>/dev/null) || cr_lease_thread=""
-    cr_lease_comment=$(echo "$crash_info" | jq -r '.leaseCommentId // empty' 2>/dev/null) || cr_lease_comment=""
-    cr_lease_expires=$(echo "$crash_info" | jq -r '.leaseExpires // 0' 2>/dev/null) || cr_lease_expires=0
-
-    [ -z "$cr_pr" ] && { rm -f "$crash_file"; continue; }
-
-    echo "[$(date '+%H:%M:%S')] 🔧 Recovering PR #${cr_pr} (crashed on ${cr_host}, exit code ${cr_code})"
-
-    # Wait until the lease has expired before posting (avoid conflicting with active processing)
-    local now wait_until wait_secs
-    now=$(date +%s)
-    wait_until=$((cr_lease_expires + 60))
-    wait_secs=$((wait_until - now))
-    if [ "$wait_secs" -gt 0 ]; then
-      # Cap wait to 35 minutes to avoid indefinite hangs
-      [ "$wait_secs" -gt 2100 ] && wait_secs=2100
-      echo "[$(date '+%H:%M:%S')] 🔧 PR #${cr_pr}: waiting ${wait_secs}s for lease expiry..."
-      sleep "$wait_secs"
-    fi
-
-    # Re-check: if another bot already picked up this PR, skip
-    if [ -n "$cr_repo" ] && [ -n "$cr_lease_thread" ]; then
-      # Source lease functions for check_pr_lease
-      local ADO_BASE="https://dev.azure.com/${ADO_ORG}/${ADO_PROJECT}/_apis"
-      local PR_THREADS_JSON=""
-      local EXISTING_LEASE_HOST=""
-      # Portable base64
-      b64_encode() { base64 | tr -d '\n'; }
-      # Source auth helper for recovery
-      if [ -f "$SCRIPT_DIR/../shared/ado_auth.sh" ]; then
-        source "$SCRIPT_DIR/../shared/ado_auth.sh"
-      fi
-      local _auth_header
-      _auth_header=$(get_ado_auth_header_cached 2>/dev/null) || _auth_header="Basic $(echo -n ":${ADO_PAT:-}" | b64_encode)"
-      # Minimal ado_api_call for recovery (reuse from sourced scripts)
-      local check_response
-      check_response=$(curl -s --max-time 15 \
-        -H "Authorization: $_auth_header" \
-        "${ADO_BASE}/git/repositories/${cr_repo}/pullRequests/${cr_pr}/threads?api-version=7.1" 2>/dev/null) || true
-
-      if [ -n "$check_response" ]; then
-        local active_lease
-        # GUARD: $check_response is the raw ADO threads API body, which can be a non-JSON
-        # 503/"Services Unavailable" HTML page (observed live) → jq exits 5 → `set -e`.
-        # Trade-off: the `|| active_lease=""` fallback then skips the lease check and proceeds
-        # to recovery — the safe default (never strands a stuck PR), at the cost of a possible
-        # duplicate recovery across pods during a transient ADO outage (benign: downstream is idempotent).
-        active_lease=$(echo "$check_response" | jq -r --argjson now "$(date +%s)" --argjson grace 60 '
-          [.value[]
-           | .comments[]?
-           | .content // ""
-           | capture("<!-- pr-bot-lease:(?<json>\\{[^}]+\\}) -->")
-           | .json | fromjson
-           | select(.expires + $grace > $now)
-           | select(.status != "done" and .status != "failed")
-          ] | first // empty' 2>/dev/null) || active_lease=""
-
-        if [ -n "$active_lease" ]; then
-          echo "[$(date '+%H:%M:%S')] 🔧 PR #${cr_pr}: another bot has active lease, skipping recovery"
-          rm -f "$crash_file"
-          continue
-        fi
-      fi
-
-      # Post crash notice on the status thread
-      if [ -n "$cr_lease_thread" ] && [ -n "$cr_lease_comment" ]; then
-        local notice_content
-        notice_content="⚠️ **Left Jab Bot**: Crashed on \`${cr_host}\` (exit code ${cr_code}) at ${cr_ts}. The PR was not fully processed. Re-trigger by pushing a commit or re-opening a review thread."
-        local notice_body
-        notice_body=$(jq -n --arg c "$notice_content" '{content:$c,parentCommentId:1,commentType:1}') || notice_body=""
-        # GUARD: if jq failed, $notice_body is empty — POSTing it would silently drop the
-        # crash notice (a no-op the "posted" log would falsely claim succeeded). Skip + warn instead.
-        if [ -n "$notice_body" ]; then
-          curl -s --max-time 15 \
-            -X POST \
-            -H "Authorization: $_auth_header" \
-            -H "Content-Type: application/json" \
-            -d "$notice_body" \
-            "${ADO_BASE}/git/repositories/${cr_repo}/pullRequests/${cr_pr}/threads/${cr_lease_thread}/comments?api-version=7.1" >/dev/null 2>&1 || true
-          echo "[$(date '+%H:%M:%S')] 🔧 PR #${cr_pr}: posted crash notice on status thread"
-        else
-          echo "[$(date '+%H:%M:%S')] ⚠️  PR #${cr_pr}: skipped crash notice — failed to build notice body (jq error)"
-        fi
-      fi
-    fi
-
-    rm -f "$crash_file"
-    echo "[$(date '+%H:%M:%S')] 🔧 PR #${cr_pr}: recovery complete"
-  done
-
-  # Explicit lock release (see the RETURN-trap note above — do not convert this
-  # to a trap). The in-loop `continue`s keep the lock held until the pass ends.
-  rm -f "$_recover_lock/pid" 2>/dev/null
-  rmdir "$_recover_lock" 2>/dev/null || true
+  printf 'Authorization: %s\n' "$auth" | curl "${args[@]}" "$url"
 }
+
+pr_recovery_record_valid() {
+  pr_json_single_object "$1" || return 1
+  printf '%s' "$1" | jq -e --arg org "$ADO_ORG" --arg project "$ADO_PROJECT" '
+    def id: (type == "string" or type == "number") and (tostring | test("^[1-9][0-9]{0,9}$"));
+    def epoch: type == "number" and . > 0 and . < 100000000000 and floor == .;
+    .version == 2 and .org == $org and .project == $project and
+    (.pr | id) and (.leaseThreadId | id) and (.leaseCommentId | id) and
+    (.pid | id) and (.leaseStarted | epoch) and (.leaseExpires | epoch) and
+    (.crashedAt | epoch) and .leaseExpires > .leaseStarted and .crashedAt >= .leaseStarted and
+    (.exitCode | tostring | test("^[1-9][0-9]{0,2}$")) and
+    (.host | type == "string" and test("^[A-Za-z0-9_.-]{1,255}$")) and
+    (.sourceRef | type == "string" and startswith("refs/heads/") and length > 11) and
+    (.targetRef | type == "string" and startswith("refs/heads/") and length > 11) and
+    (.head | type == "string" and test("^[0-9a-f]{40}$"))
+  ' >/dev/null 2>&1 || return 1
+  local source_ref target_ref
+  source_ref=$(printf '%s' "$1" | jq -r '.sourceRef')
+  target_ref=$(printf '%s' "$1" | jq -r '.targetRef')
+  git check-ref-format "$source_ref" >/dev/null 2>&1 || return 1
+  git check-ref-format "$target_ref" >/dev/null 2>&1 || return 1
+  git check-ref-format --branch "${source_ref#refs/heads/}" >/dev/null 2>&1
+}
+
+# Validate the entire response and every lease, not just a best-effort grep.
+# A malformed lease or incomplete threads response must never look like no lease.
+pr_recovery_threads_safe() {
+  local response="$1" record="$2"
+  pr_json_single_object "$response" || return 1
+  printf '%s' "$response" | jq -e --argjson cr "$record" --argjson now "$(date +%s)" '
+    def id: type == "number" and . > 0 and floor == .;
+    def epoch: type == "number" and . > 0 and . < 100000000000 and floor == .;
+    def lease:
+      if test("^<!-- pr-bot-lease:\\{[^}]+\\} -->") then capture("^<!-- pr-bot-lease:(?<json>\\{[^}]+\\}) -->") | .json | fromjson else error("invalid lease") end;
+    (.value | type == "array") and (.count == (.value | length)) and
+    ([.value[] | (.id | id) and (.comments | type == "array") and
+      ([.comments[] | (.id | id) and (.content | type == "string")] | all)] | all) and
+    ([.value[].id] | length == (unique | length)) and
+    ([.value[] | [.comments[].id] | length == (unique | length)] | all) and
+    (([.value[].comments[] | select(.content | contains("pr-bot-lease")) |
+       .content | lease] ) as $leases |
+    ($leases | all((.host | type == "string") and (.pid | id) and (.ts | epoch) and
+      (if .status == "done" or .status == "failed" then true
+       else .status == null and (.expires | epoch) end))) and
+    ($leases | all(.status == "done" or .status == "failed" or .expires + 60 <= $now)) and
+    ([.value[] | select((.id | tostring) == ($cr.leaseThreadId | tostring))] | length == 1) and
+    ([.value[] | select((.id | tostring) == ($cr.leaseThreadId | tostring)) |
+      select(.isDeleted != true) |
+      select(.comments[0].content | contains("<!-- pr-bot-status:PR-" + ($cr.pr | tostring) + " -->")) |
+      .comments[] | select((.id | tostring) == ($cr.leaseCommentId | tostring)) |
+      select(.isDeleted != true) | .content | lease |
+      select(.host == $cr.host and (.pid | tostring) == ($cr.pid | tostring)) |
+      select(if .status == "failed" then .ts >= $cr.leaseStarted and .ts <= $cr.crashedAt
+             else .status == null and .ts == $cr.leaseStarted and .expires == $cr.leaseExpires end)
+    ] | length == 1))
+  ' >/dev/null 2>&1
+}
+
+# Subshell keeps the GET adapter and guard context private to this artifact.
+# Guard outputs/GET adapter are consumed by sourced guard functions.
+# shellcheck disable=SC2034,SC2153,SC2329
+pr_recover_record() (
+  local file="$1" record event threads body response marker
+  [ ! -L "$file" ] || return 1
+  record=$(cat "$file") || return 1
+  pr_recovery_record_valid "$record" || return 1
+  [ "$(basename "$file")" = "pr-$(printf '%s' "$record" | jq -r '.pr').crashed" ] || return 1
+  event=$(printf '%s' "$record" | jq -c '{resource:{pullRequest:{pullRequestId:.pr,repository:{id:.repoId}}}}') || return 1
+  ado_api_request() { pr_recovery_request "$@"; }
+  pr_guard_init "$event" || return 1
+  PR_GUARD_SOURCE_REF=$(printf '%s' "$record" | jq -r '.sourceRef')
+  PR_GUARD_TARGET_REF=$(printf '%s' "$record" | jq -r '.targetRef')
+  local head thread comment_url
+  head=$(printf '%s' "$record" | jq -r '.head')
+  thread=$(printf '%s' "$record" | jq -r '.leaseThreadId')
+  comment_url="${ADO_BASE}/git/repositories/${REPO_ID}/pullRequests/${PR_ID}/threads/${thread}/comments?api-version=7.1"
+  marker=$(printf '%s' "$record" | jq -r '"<!-- pr-bot-status:recovery-\(.pr)-\(.pid)-\(.leaseStarted)-\(.crashedAt) -->"')
+  body=$(printf '%s' "$record" | jq -cn --arg marker "$marker" --argjson cr "$record" \
+    '{content:($marker + "\n⚠️ **Left Jab Bot**: Crashed on `" + $cr.host + "` (exit code " + ($cr.exitCode|tostring) + "). The PR was not fully processed. Re-trigger by pushing a commit or re-opening a review thread."),parentCommentId:1,commentType:1}') || return 1
+  # Two checks cover setup and the final write boundary. There is no mutation on
+  # the read path, and every periodic retry starts from scratch.
+  local pass
+  for pass in 1 2; do
+    pr_guard_refresh "$head" || return 1
+    threads=$(pr_recovery_request "${ADO_BASE}/git/repositories/${REPO_ID}/pullRequests/${PR_ID}/threads?api-version=7.1") || return 1
+    pr_recovery_threads_safe "$threads" "$record" || return 1
+    if printf '%s' "$threads" | jq -e --arg tid "$thread" --arg content "$(printf '%s' "$body" | jq -r '.content')" \
+      '[.value[] | select((.id|tostring) == $tid) | .comments[] | select(.isDeleted != true) | .content == $content] | any' >/dev/null; then
+      # A previous POST may have succeeded despite a lost response.
+      pr_crash_state_update "$file" remove "$record"
+      return $?
+    fi
+  done
+  pr_guard_refresh "$head" || return 1
+  [ "$(cat "$file")" = "$record" ] || return 1
+  response=$(pr_recovery_request "$comment_url" POST "$body") || return 1
+  pr_json_single_object "$response" || return 1
+  printf '%s' "$response" | jq -e --arg content "$(printf '%s' "$body" | jq -r '.content')" \
+    '(.id | type == "number" and . > 0 and floor == .) and .content == $content' >/dev/null || return 1
+  pr_crash_state_update "$file" remove "$record"
+)
+
+recover_crashed_prs() (
+  # Linux uses a kernel-owned lock, released even on SIGKILL. On hosts without
+  # flock, use a conservative directory lock; a killed pass then needs operator
+  # cleanup. Do not race another startup by reclaiming an uninitialized lock.
+  local lock="$STATE_DIR/.recover.lock" crash_file recovery_fd
+  if command -v flock >/dev/null 2>&1; then
+    exec {recovery_fd}>"$STATE_DIR/.recover.flock"
+    flock -n "$recovery_fd" || return 0
+  else
+    mkdir "$lock" 2>/dev/null || return 0
+    trap 'rmdir "$lock" 2>/dev/null || true' EXIT
+  fi
+  for crash_file in "$STATE_DIR"/pr-*.crashed; do
+    [ -f "$crash_file" ] || continue
+    if pr_recover_record "$crash_file"; then
+      echo "[$(date '+%H:%M:%S')] 🔧 Crash recovery confirmed: $(basename "$crash_file")"
+    else
+      echo "[$(date '+%H:%M:%S')] ⚠️ Crash recovery deferred; retained for retry/inspection: $(basename "$crash_file")"
+    fi
+  done
+)
 
 # Run crash recovery in background so it doesn't block the ntfy loop
 recover_crashed_prs &
@@ -1377,6 +1388,10 @@ replay_queued_messages() {
     fi
     local replay_body
     replay_body=$(cat "$qf")
+    if ! pr_event_valid "$replay_body"; then
+      rm -f "$qf"
+      continue
+    fi
     local replay_pr_id
     # GUARD: a queue file persisted by a host that died mid-write can be truncated/non-JSON.
     # replay_queued_messages runs in the FOREGROUND at startup, so an unguarded jq exit 5 here
@@ -1437,6 +1452,10 @@ cleanup() {
   echo "👋 PR Bot stopped"
   exit 0
 }
+
+# Shared with direct router and deferred replay entry points.
+# shellcheck source=../shared/pr_comment_filter.sh
+source "$SCRIPT_DIR/../shared/pr_comment_filter.sh"
 
 # Subscribe using ntfy's streaming JSON endpoint for reliable delivery.
 # This keeps a persistent HTTP connection open — ntfy pushes each event
@@ -1577,6 +1596,8 @@ while true; do
       MSG_BODY=$(echo "$msg" | jq -r '.message // empty' 2>/dev/null) || MSG_BODY=""
     fi
     [ -z "$MSG_BODY" ] && continue
+    # Applies before any event-derived PR ID is used in state/queue filenames.
+    pr_event_valid "$MSG_BODY" || continue
 
     TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
 
@@ -1587,22 +1608,20 @@ while true; do
       continue
     fi
 
-    # Break the lease-comment self-trigger loop (zero API calls — content is in the payload).
-    # The bot authenticates via PAT, so when a router PATCHes its OWN lease/status comment
+    # Break the internal-comment self-trigger loop (zero API calls — content is in the payload).
+    # The bot authenticates via PAT, so when a router PATCHes its OWN lease/status comment or posts a risk/state comment
     # (acquire_pr_lease bumps the iteration counter; release_pr_lease marks done/failed),
     # ADO fires a `git-pullrequest-comment-event` for that edit → ntfy → here. Each carries a
     # fresh notificationId so the dedup log can't catch it, and dispatching a router just
     # re-stamps the lease → another edit event → infinite tight loop (observed: 54 dispatches
     # in 11 min on one PR, burning CPU while the PR "appears stuck"). The machine markers
-    # (pr-bot-lease / pr-bot-status) are bot-internal and never require the bot to act, so
+    # (pr-bot-lease / pr-bot-status / pr-bot-state) are bot-internal and never require the bot to act, so
     # drop these events at intake. Human/review comments never carry these markers.
     PAYLOAD_COMMENT_CONTENT=$(echo "$MSG_BODY" | jq -r '.resource.comment.content // empty' 2>/dev/null) || PAYLOAD_COMMENT_CONTENT=""
-    case "$PAYLOAD_COMMENT_CONTENT" in
-      *pr-bot-lease*|*pr-bot-status*)
-        echo "[$TIMESTAMP] ⏭️  Skipping self-authored bot lease/status comment edit (no-op event, prevents self-trigger loop)"
-        continue
-        ;;
-    esac
+    if pr_comment_is_internal "$PAYLOAD_COMMENT_CONTENT"; then
+      echo "[$TIMESTAMP] ⏭️  Skipping internal bot lease/status/state comment (no-op event, prevents self-trigger loop)"
+      continue
+    fi
 
     # Foreign-lease cooldown coalescing (zero API). The self-edit filter above only
     # catches our OWN lease-comment edits. When ANOTHER host is driving

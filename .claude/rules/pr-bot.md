@@ -43,7 +43,7 @@ Two independent, case-insensitive PR markers let a human dial back the bot. They
 
 A `*-wip` source branch is treated like `[no-bot]` (Tier 2 standdown). PRs without either marker behave exactly as before.
 
-- **Implementation:** `pr_router.sh` detects both before any side effects (early payload check + authoritative PR-details recheck). `[no-auto]` → `SKIP_AUTO=1`, threaded to `run_policy_gate` (5th arg) → `auto_approve_pr`/`auto_complete_pr`/`post_risk_assessment` in `pr_policies.sh` honor `skip_auto` via additive trailing params; the risk-assessment comment gains an "⏸️ Auto-merge disabled via `[no-auto]`" line. `[no-bot]` bails with `exit 0` (no crash marker, no circuit penalty).
+- **Implementation:** `pr_event_guard.sh` resolves the configured repository and reads authoritative PR details before any lease or target-repository operation. Event titles, descriptions, branches and commit IDs do not authorize actions. It refreshes marker decisions at router-controlled action boundaries and before router-issued API mutations. `[no-auto]` → `SKIP_AUTO=1`, threaded to `run_policy_gate` (5th arg) → `auto_approve_pr`/`auto_complete_pr`/`post_risk_assessment` in `pr_policies.sh` honor `skip_auto` via additive trailing params; the risk-assessment comment gains an "⏸️ Auto-merge disabled via `[no-auto]`" line. `[no-bot]` bails with `exit 0` (no crash marker, no circuit penalty).
 - **Why the matcher asymmetry:** standing the bot *down* on the wrong PR is high-consequence, so `[no-bot]` uses the strict line-anchored matcher; merely leaving a low-risk PR for a human to merge is low-consequence, so `[no-auto]` uses a lenient substring (and must match `[SPEC][no-auto]`).
 - **Caveat (chicken-and-egg):** the deployed bot snapshots its scripts at startup. A change to the `[no-auto]`/`[no-bot]` logic only takes effect after merge **and** `systemctl --user restart pr-bot`. So tagging the very PR that introduces/modifies this logic will **not** stop the currently running bot — protect that PR with a human watcher or pause the bot.
 
@@ -116,10 +116,10 @@ The snapshot mechanism regenerates on startup, picking up the new files.
 ## Crash Recovery
 
 When `pr_router.sh` exits non-zero, `cleanup()` writes a `.crashed` marker file to `$STATE_DIR/pr-<ID>.crashed`. On next startup, `recover_crashed_prs()` in `start.sh`:
-1. Waits for the lease to expire (avoids conflicting with active processing)
-2. Re-checks for active leases (skips if another bot took over)
-3. Posts a crash notice on the PR status thread
-4. Deletes the `.crashed` file
+1. Validates the versioned crash record and authoritative configured PR context
+2. Defers while any lease remains active; rejects stale/reused lease state
+3. Rechecks opt-outs/identity/head and leases before posting a marked crash notice
+4. Deletes only the unchanged record after confirmed posting or matching notice
 
 ## Memory Management & OOM Protection
 
@@ -200,11 +200,11 @@ The guard is a **zero-API intake filter** in `start.sh` (mirrored as defense-in-
 
 The bot's worktree is filesystem-isolated, but it checks out the **same source branch** and pushes to the **same remote ref** as a human or interactive agent working that PR. The collision is therefore at the **ref/push level**: the bot's recovery push could clobber a commit someone pushed seconds earlier. Three cooperating layers de-risk this:
 
-1. **Tier 1 — `[no-bot]` full stand-down.** If the PR **title or description** carries `[no-bot]` **as a directive** (the marker at the start of a line — optionally after a list/quote bullet — *not* backticked or buried mid-sentence; matched by `pr_text_has_directive`, case-insensitive), the router bails at the **earliest possible point** (before the per-PR lock, lease, or worktree — before the `EXIT` trap is even armed) with `exit 0`: no lease, no worktree, no push, no circuit state. A best-effort check reads the webhook payload first; an **authoritative re-check** runs after `PR_DETAILS` is fetched (still before lease/worktree) to catch comment-event payloads that omit the title. `pr_heartbeat.sh` applies the same skip. **The directive-not-prose match is deliberate:** a bare substring grep false-fires on any PR that merely *documents* the marker — e.g. this feature's own PR title.
+1. **Tier 1 — `[no-bot]` full stand-down.** If the PR **title or description** carries `[no-bot]` **as a directive** (the marker at the start of a line — optionally after a list/quote bullet — *not* backticked or buried mid-sentence; matched by `pr_text_has_directive`, case-insensitive), the router bails at the **earliest possible point** (before the per-PR lock, lease, or worktree — before the `EXIT` trap is even armed) with `exit 0`: no lease, no worktree, no push, no circuit state. An authenticated PR-details read runs for every new event, including queued replay, before lease/worktree operations. Later reads reset marker flags rather than retaining event or stale values. `pr_heartbeat.sh` applies the same skip. **The directive-not-prose match is deliberate:** a bare substring grep false-fires on any PR that merely *documents* the marker — e.g. this feature's own PR title.
 
 2. **Tier 2 — `*-wip` branch skip.** A source branch ending in **`-wip`** (configurable via `PR_BOT_WIP_SUFFIX`, default `-wip`) is treated as a human/agent scratch ref: the bot skips it (router `exit 0`, and heartbeat skip). Matching is a **suffix** test — `wip-feature` and `feature-wip-x` do **not** match; only `feature-wip` does.
 
-3. **Push safety — `--force-with-lease` + rebase + bounded retry → yield.** The recovery push uses **`--force-with-lease`** (not a bare force-push), so it only overwrites the remote ref if it still points where the router's last fetch saw it. If a concurrent push moved it, git **rejects** instead of clobbering; the router then **fetch + rebase**es its commits on top and retries, up to **`PR_BOT_PUSH_RETRIES`** times (default **2**). If still contended after the budget (or the rebase conflicts), it **yields via `exit 75`** rather than fight — freeing the slot while the heartbeat re-dispatches ~5 min later.
+3. **Push safety — `--force-with-lease` + rebase + bounded retry → yield.** The recovery push uses **`--force-with-lease`** (not a bare force-push), so it only overwrites the remote ref if it still points at the authoritative pre-session head. Verification fetches do not advance this explicit lease. A retry advances it only after rebasing onto the captured SHA of the newly fetched tip, never a mutable remote-tracking ref. If a concurrent push moved it, git **rejects** instead of clobbering; the router then **fetch + rebase**es its commits on top and retries, up to **`PR_BOT_PUSH_RETRIES`** times (default **2**). If still contended after the budget (or the rebase conflicts), it **yields via `exit 75`** rather than fight — freeing the slot while the heartbeat re-dispatches ~5 min later.
 
    > **Error classification:** The retry loop distinguishes **concurrency rejections** (git stderr containing `stale info`, `failed to push`, `non-fast-forward`, etc.) from **non-transient errors** (expired credential, branch-policy rejection, network outage). Only concurrency rejections trigger rebase+retry and the yield path (exit 75); non-transient errors fall through to `exit 1` so the circuit breaker engages.
 
@@ -240,3 +240,44 @@ pgrep -af 'claude --print'
 # Inspect what the orphan reaper WOULD reap (no kills)
 ./src/build/pr-bot/start.sh --reap-orphans-dryrun
 ```
+
+## Event context validation
+
+`pr_event_guard.sh` bounds router work to `ADO_ORG`, `ADO_PROJECT`, and `ADO_REPO`
+(name or GUID). A payload must contain exactly one root JSON object. Missing or
+invalid PR context, mismatched repository/project identity, unavailable
+authoritative reads, fork sources, and a different target checkout
+origin all fail closed. The origin must match the configured repository's ADO
+`remoteUrl` or `sshUrl` (HTTPS usernames and a trailing slash are normalized).
+Every effective origin fetch/push URL must match, including separate pushurl and
+Git URL-rewrite settings. Router recovery pushes recheck the effective URLs.
+Changed source/target refs yield rather than silently retargeting an active run.
+Risk decisions are bound to the worktree's authoritative source commit.
+
+Every router-issued API mutation refreshes PR state, including delayed retries.
+The only cleanup exception releases this run's held lease comment. `[no-auto]`
+continues to permit ordinary maintenance while suppressing approval/completion.
+The configured model and its permissions are unchanged: these checks do not
+sandbox independent writes inside an already-running model session, and ADO
+metadata reads and subsequent writes are not atomic.
+
+Deploy the reviewed harness source, including the guard module, together. Startup
+recreates `script-snapshot` from that source; editing only the snapshot is not a
+persistent deployment.
+
+Daemon crash recovery uses the same authoritative repository/PR checks before
+posting notices. New version-2 crash records bind configured org/project, repo,
+PR refs/head and lease owner/acquisition. Legacy, malformed, foreign, superseded,
+opted-out and unavailable records are retained for inspection/retry, never
+silently migrated or discarded. Every notice checks all leases and its original
+status thread; active leases block even if owned by the crashed process. Recovery
+does not release inherited leases. Failed HTTP/read responses retain the record;
+a deterministic notice marker prevents reposting after an uncertain response.
+Linux flock releases the recovery lock after process death. Without flock, the
+portable directory lock fails closed after SIGKILL and needs operator cleanup.
+
+Crash-record publication uses a same-directory temporary file and atomic rename.
+Router publication and recovery compare/removal share a short per-PR state lock,
+never held during HTTP. If that lock cannot be acquired, publication preserves a
+`.crashed.pending.*` file for operator inspection instead of losing the new record.
+Both recorded refs must be valid nonempty branch refs before recovery reads ADO.

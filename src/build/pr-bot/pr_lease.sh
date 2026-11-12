@@ -197,6 +197,11 @@ acquire_pr_lease() {
   local now
   now=$(date +%s)
   local expires=$((now + ${CLAUDE_TIMEOUT:-1800}))
+  # Bind any later crash record to this acquisition, not merely a reused comment.
+  # shellcheck disable=SC2034 # read by router crash-marker writer
+  LEASE_STARTED=$now
+  # shellcheck disable=SC2034 # read by router crash-marker writer
+  LEASE_EXPIRES=$expires
 
   # Ensure persistent status thread exists
   ensure_status_thread "$pr_id" "$repo_id" || {
