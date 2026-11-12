@@ -1,15 +1,19 @@
 #!/usr/bin/env bash
 # Exercise the deployed intake block, not a duplicate filter implementation.
+# Variables are consumed by eval of the shipped block; one-pass loops test continue.
+# shellcheck disable=SC2034,SC2043
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 START="$SCRIPT_DIR/../pr-bot/start.sh"
 # Extract the pure helper and actual intake block without starting the daemon.
 eval "$(sed -n '/^pr_comment_is_internal() {/,/^}/p' "$START")"
 INTAKE=$(sed -n '/^    PAYLOAD_COMMENT_CONTENT=/,/^    fi$/p' "$START")
+# This deliberately matches the literal variable reference in the source.
+# shellcheck disable=SC2016
 [[ "$INTAKE" == *'pr_comment_is_internal "$PAYLOAD_COMMENT_CONTENT"'* ]] || exit 1
 PASS=0
 check_event() {
-  local expected="$1" label="$2" content="$3" dispatched=0 MSG_BODY TIMESTAMP=test
+  local expected="$1" label="$2" content="$3" dispatched=0 MSG_BODY TIMESTAMP='test'
   MSG_BODY=$(jq -n --arg c "$content" '{resource:{comment:{content:$c}}}')
   # continue must skip the dispatch line in exactly the shipped intake block.
   for _event in once; do
@@ -38,7 +42,7 @@ check_event 1 other-marker '<!-- human-review:important -->'
 check_event 1 incomplete-marker '<!-- pr-bot-state:'
 # A non-comment event must still reach the normal downstream routing.
 MSG_BODY='{"resource":{"pullRequest":{"pullRequestId":123}}}'
-dispatched=0; TIMESTAMP=test
+dispatched=0; TIMESTAMP='test'
 for _event in once; do eval "$INTAKE" >/dev/null; dispatched=1; done
 [ "$dispatched" -eq 1 ];PASS=$((PASS + 1))
 printf 'Self-comment filter: %s passed, 0 failed\n' "$PASS"

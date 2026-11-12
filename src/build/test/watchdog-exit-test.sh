@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Fixture globals are consumed by the eval-loaded production functions.
+# shellcheck disable=SC2034
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 START="$SCRIPT_DIR/../pr-bot/start.sh"
@@ -24,7 +26,7 @@ _kill_subtree() {
 kill_oversized_claudes >/dev/null
 reap_jobs > "$STATE_DIR/output"
 grep -q 'exited with code 137' "$STATE_DIR/output"
-! grep -q 'completed successfully' "$STATE_DIR/output"
+if grep -q 'completed successfully' "$STATE_DIR/output"; then exit 1; fi
 [ -f "$STATE_DIR/queue" ]
 [ ! -f "$STATE_DIR/pr-123.watchdog-123456.lastexit" ]
 # An ordinary zero exit is still successful and clears its queue.
