@@ -102,13 +102,22 @@ ORPHAN=$!
 SPAWNED+=("$ORPHAN")
 
 # DENY: an executable whose comm is denylisted (git-gc), also off ROOT's tree.
-cp "$(command -v sleep)" "$TMPDIR_TEST/git-gc"
-"$TMPDIR_TEST/git-gc" 600 &
+# Do not rename sleep: Ubuntu's multicall coreutils dispatches by argv[0] and
+# rejects "git-gc". Bash does not, and blocking on a FIFO needs no child process.
+cp "$(command -v bash)" "$TMPDIR_TEST/git-gc"
+mkfifo "$TMPDIR_TEST/deny.wait"
+"$TMPDIR_TEST/git-gc" -c 'read -r _ < "$1"' _ "$TMPDIR_TEST/deny.wait" &
 DENY=$!
 SPAWNED+=("$DENY")
 
 # Give procs a moment to materialize in /proc and the process table.
 sleep 0.3
+# Fail as fixture setup, not as a misleading denylist/reaper failure.
+DENY_COMM=$(ps -o comm= -p "$DENY" 2>/dev/null | awk '{print $1}') || DENY_COMM=""
+if ! kill -0 "$DENY" 2>/dev/null || [ "${DENY_COMM##*/}" != "git-gc" ]; then
+  echo "❌ Setup failed: DENY fixture is not alive with comm=git-gc"
+  exit 1
+fi
 
 # --- Fabricated cgroup.procs: everything "in the cgroup" ---
 PROCS_FILE="$TMPDIR_TEST/cgroup.procs"
