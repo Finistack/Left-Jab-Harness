@@ -1453,11 +1453,9 @@ cleanup() {
   exit 0
 }
 
-# Internal comments are notifications of the bot's own work, not new work.
-# Match the machine comment syntax, not ordinary prose mentioning a marker name.
-pr_comment_is_internal() {
-  printf '%s\n' "${1:-}" | grep -Eq '<!--[[:space:]]*pr-bot-(lease|status|state):[^>]*-->'
-}
+# Shared with direct router and deferred replay entry points.
+# shellcheck source=../shared/pr_comment_filter.sh
+source "$SCRIPT_DIR/../shared/pr_comment_filter.sh"
 
 # Subscribe using ntfy's streaming JSON endpoint for reliable delivery.
 # This keeps a persistent HTTP connection open — ntfy pushes each event

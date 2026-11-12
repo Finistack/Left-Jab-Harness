@@ -5,8 +5,18 @@
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 START="$SCRIPT_DIR/../pr-bot/start.sh"
-# Extract the pure helper and actual intake block without starting the daemon.
-eval "$(sed -n '/^pr_comment_is_internal() {/,/^}/p' "$START")"
+ROUTER="$SCRIPT_DIR/../pr-bot/pr_router.sh"
+# Use the shared implementation and verify both production paths source it.
+# shellcheck source=../shared/pr_comment_filter.sh
+source "$SCRIPT_DIR/../shared/pr_comment_filter.sh"
+for entry in "$START" "$ROUTER"; do
+  # shellcheck disable=SC2016 # verify the literal source reference
+  grep -Fq 'source "$SCRIPT_DIR/../shared/pr_comment_filter.sh"' "$entry"
+done
+ROUTER_FILTER=$(sed -n '/^_ROUTER_COMMENT_CONTENT=/,/^fi$/p' "$ROUTER")
+# shellcheck disable=SC2016
+[[ "$ROUTER_FILTER" == *'pr_comment_is_internal "$_ROUTER_COMMENT_CONTENT"'* ]] || exit 1
+log() { :; }
 INTAKE=$(sed -n '/^    PAYLOAD_COMMENT_CONTENT=/,/^    fi$/p' "$START")
 # This deliberately matches the literal variable reference in the source.
 # shellcheck disable=SC2016
@@ -22,6 +32,15 @@ check_event() {
   done
   if [ "$dispatched" -ne "$expected" ]; then
     printf 'FAIL: %s (dispatch=%s, expected=%s)\n' "$label" "$dispatched" "$expected"
+    return 1
+  fi
+  PASS=$((PASS + 1))
+  # Actual router block exits for internal events, but human comments continue.
+  local PAYLOAD="$MSG_BODY" router_dispatched
+  router_dispatched=$(eval "$ROUTER_FILTER"; printf 'dispatched')
+  if { [ "$expected" -eq 0 ] && [ -n "$router_dispatched" ]; } ||
+     { [ "$expected" -eq 1 ] && [ "$router_dispatched" != dispatched ]; }; then
+    printf 'FAIL: router/replay %s (expected=%s)\n' "$label" "$expected"
     return 1
   fi
   PASS=$((PASS + 1))

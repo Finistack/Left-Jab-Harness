@@ -188,19 +188,14 @@ case "$EVENT_TYPE" in
     ;;
 esac
 
-# Defense-in-depth against the lease-comment self-trigger loop (start.sh filters this
-# at intake; this guards the deferred-queue replay path which re-injects raw payloads
-# that bypass intake). When a router PATCHes its own lease/status comment, ADO emits a
-# comment-edit event with our machine marker in .resource.comment.content. Acting on it
-# would just re-stamp the lease and emit another event — a tight CPU loop. These markers
-# are bot-internal; a human comment never carries them, so bail without dispatching work.
+# Direct calls and deferred replay must apply the same filter as daemon intake.
+# shellcheck source=../shared/pr_comment_filter.sh
+source "$SCRIPT_DIR/../shared/pr_comment_filter.sh"
 _ROUTER_COMMENT_CONTENT=$(echo "$PAYLOAD" | jq -r '.resource.comment.content // empty' 2>/dev/null) || true
-case "$_ROUTER_COMMENT_CONTENT" in
-  *pr-bot-lease*|*pr-bot-status*)
-    log "⏭️  Skipping self-authored bot lease/status comment edit (no-op event, prevents self-trigger loop)"
-    exit 0
-    ;;
-esac
+if pr_comment_is_internal "$_ROUTER_COMMENT_CONTENT"; then
+  log "⏭️  Skipping internal bot lease/status/state comment (no-op event, prevents self-trigger loop)"
+  exit 0
+fi
 
 # Log payload structure for debugging (keys only, not values which may contain secrets)
 log "📥 Payload keys: $(echo "$PAYLOAD" | jq -r 'keys | join(", ")' 2>/dev/null || echo 'unknown')"
