@@ -26,3 +26,14 @@ ignored; unmarked human comments must remain eligible. Never generate external
 PR comments just to test without authorization. Verify an existing delivery or a
 new genuine event through intake, routing and response; distinguish heartbeat
 recovery from a human-comment-triggered response.
+
+### Intentional risk holds versus failed workers
+
+A guarded HIGH-risk refusal writes a local `pr-<id>.policy-hold.json` recovery
+hint. Heartbeat does not repeat its merge-only assessment while the source and
+target commits, refs, title/description, reviewers and policy configuration/status
+are unchanged. New comments or failed builds still take the actionable-work path;
+genuine webhook events are never filtered by this hint. New commits or a title
+risk-approval directive invalidate it. Missing, malformed or unwritable hints
+leave recovery enabled; UNKNOWN classifier failures are not cached. This does not
+approve a PR, bypass risk review, or change the existing self-comment filter.

@@ -521,6 +521,13 @@ run_policy_gate() {
     risk_override="$RISK_OVERRIDE"
   fi
 
+  # A new genuine-event attempt supersedes any older terminal decision, even if
+  # it later fails or the classifier is temporarily unavailable.
+  if [ -n "$PR_GUARD_POLICY_HEAD" ] && declare -F pr_policy_hold_clear >/dev/null; then
+    pr_policy_hold_clear "$pr_id" || return 1
+  fi
+  local policy_hold_pr="${PR_DETAILS:-}"
+
   # 1. Classify risk
   local risk_json
   risk_json=$(classify_pr_risk "$pr_id" "$repo_id" "$work_dir")
@@ -587,6 +594,21 @@ run_policy_gate() {
     risk_override="$RISK_OVERRIDE"
   fi
   post_risk_assessment "$pr_id" "$repo_id" "$risk_json" "$approved" "$auto_completed" "$skip_auto" "$risk_override"
+
+  # Only cache an intentional HIGH refusal from the authoritative guarded PR.
+  # Never suppress recovery after UNKNOWN/transient failures or grant approval.
+  if [ "$risk_level" = high ] && [ "$risk_override" != 1 ] &&
+     [ "$approved" = false ] && [ "$auto_completed" = false ] &&
+     [ -n "$PR_GUARD_POLICY_HEAD" ] &&
+     declare -F pr_policy_hold_record >/dev/null; then
+    local initial_hold_key current_hold_key
+    initial_hold_key=$(pr_policy_hold_key "$policy_hold_pr" "$policy_evals") || initial_hold_key=""
+    current_hold_key=$(pr_policy_hold_key "$PR_DETAILS" "$policy_evals") || current_hold_key=""
+    if [ -n "$initial_hold_key" ] && [ "$initial_hold_key" = "$current_hold_key" ]; then
+      pr_policy_hold_record "$pr_id" "$PR_DETAILS" "$policy_evals" ||
+        log "⚠️ Could not save policy hold; merge recovery remains enabled"
+    fi
+  fi
 
   log "🏁 Policy gate complete (risk: ${risk_level}, approved: ${approved}, auto-complete: ${auto_completed}, skip_auto: ${skip_auto}, risk_override: ${risk_override})"
 }
