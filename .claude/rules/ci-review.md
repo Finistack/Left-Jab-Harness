@@ -28,15 +28,20 @@ GitHub PR → ADO pipeline → claude -p (diff) → github-pr-review.py → GitH
 
 | File | Role |
 |------|------|
-| `claude-pr-review-pipeline.yml` | The pipeline: Node + Claude CLI, compute diff, `claude -p`, run the poster, publish the artifact. |
+| `claude-pr-review-pipeline.yml` | The pipeline: Node + job-local Claude CLI, compute diff, `claude -p`, run the poster, publish the artifact. |
 | `src/build/github-pr-review.py` | The poster — stdlib `urllib` only; REST for writes, GraphQL for thread state. First Python file in this otherwise-bash repo. |
 | `src/build/test/github-pr-review-test.sh` | Pure-function unit test; shells to `python3`, loads the hyphenated module via `importlib`. Auto-discovered by the CI `for t in src/build/test/*.sh` loop (no wiring change). |
 
 ## How it works
 
-1. `git diff origin/$TARGET...HEAD` → `/tmp/pr-diff.txt` (10-byte floor skip, `MAX_DIFF_BYTES` upper cap).
-2. Pipe the diff to `claude -p "<senior reviewer prompt>" --output-format json` (`|| true`).
-3. `github-pr-review.py` parses the Claude envelope and runs the 7-step flow (below).
+1. Prepare a private `CI_JOB_DIR`. Install Claude with npm using the job-local
+   `cli` prefix and `npm-cache`.
+2. Write `git diff origin/$TARGET...HEAD` to `$CI_JOB_DIR/pr-diff.txt` (10-byte floor
+   skip, `MAX_DIFF_BYTES` upper cap).
+3. Run the job-local Claude CLI with `-p "<senior reviewer prompt>" --output-format json`
+   (`|| true`), writing results and stderr in `CI_JOB_DIR`.
+4. `github-pr-review.py` parses the job-local Claude results and runs the 7-step flow
+   below. The job removes the private directory afterward.
 
 ### The poster's 7-step flow (mirrors the ADO poster)
 
