@@ -489,6 +489,46 @@ run_retry_transport() {
 expect_rc 1 'delayed write retry rechecks authoritative opt-out' run_retry_transport
 expect_rc 0 'no second mutation after changed marker' test "$(wc -l < "$TEST_DIR/http-mutations" | tr -d ' ')" = 1
 
+# Exercise the shipped prompt combinations without running the router or model.
+PROMPT_SETUP=$(awk '
+  /^# Adjust Claude prompt/ { capture=1; next }
+  /^# Resolve token-savior MCP binary/ && capture { ended=1; exit }
+  capture { print }
+  END { if (!ended) exit 1 }
+' "$BOT/pr_router.sh") || { echo "Could not bound router prompt fixture" >&2; exit 1; }
+[ -n "$PROMPT_SETUP" ] || { echo "Router prompt fixture is empty" >&2; exit 1; }
+compose_router_prompt() (
+  HAS_UNRESOLVED_COMMENTS="$1"
+  HAS_FAILING_BUILD="$2"
+  HAS_MERGE_CONFLICT="$3"
+  THREADS_CAPPED=false
+  SOURCE_BRANCH=feature
+  BUILD_FAILURE_CONTEXT=' fixture build context'
+  MERGE_CONFLICT_CONTEXT='fixture conflict context'
+  eval "$PROMPT_SETUP"
+  printf '%s\n' "$CLAUDE_TASK"
+)
+expect_review_guidance() {
+  local want="$1" prompt label
+  shift
+  prompt=$(compose_router_prompt "$@") || return
+  [[ "$prompt" == *'IMPORTANT EFFICIENCY RULES'* ]] || return 1
+  [[ "$prompt" == *'avoid unrelated or broad comment-only diffs'* ]] || return 1
+  for label in 'Check each captured review thread' 'disposition for each captured thread' 'remove redundant adjacent narration'; do
+    if [ "$want" = yes ]; then
+      [[ "$prompt" == *"$label"* ]] || return 1
+    else
+      [[ "$prompt" != *"$label"* ]] || return 1
+    fi
+  done
+}
+expect_rc 0 'review-only prompt includes captured-thread guidance' expect_review_guidance yes true false false
+expect_rc 0 'review plus build prompt includes captured-thread guidance' expect_review_guidance yes true true false
+expect_rc 0 'review plus conflict prompt includes captured-thread guidance' expect_review_guidance yes true false true
+expect_rc 0 'build-only prompt omits captured-thread guidance' expect_review_guidance no false true false
+expect_rc 0 'conflict-only prompt omits captured-thread guidance' expect_review_guidance no false false true
+expect_rc 0 'build plus conflict prompt omits captured-thread guidance' expect_review_guidance no false true true
+
 # Wiring checks ensure every ingress validates before using event-derived paths,
 # and the boundary hook cannot disappear while helper-level tests keep passing.
 python3 - "$BOT" <<'PY'
