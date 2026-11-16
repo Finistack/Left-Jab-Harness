@@ -32,6 +32,7 @@ fi
 # loop (router crash → heartbeat re-queues same HEAD → crash → repeat).
 source "$SCRIPT_DIR/pr_circuit.sh"
 source "$SCRIPT_DIR/pr_constants.sh"
+source "$SCRIPT_DIR/pr_policy_hold.sh"
 
 ADO_BASE="https://dev.azure.com/${ADO_ORG}/${ADO_PROJECT}/_apis"
 ADO_REPO="${ADO_REPO:-your-repo}"
@@ -182,6 +183,19 @@ pr_is_ready_but_unmerged() {
   # No blocking build policy means there is nothing ADO would wait on. If blocking
   # policies exist, all of them must be approved; queued/running/rejected is not ready.
   if [ "$build_total" -gt 0 ] && [ "$build_total" -ne "$build_approved" ]; then
+    return 1
+  fi
+
+  # A completed HIGH-risk refusal is not an interrupted merge step. Compare
+  # the same single-PR GET shape the router records; list responses can omit or
+  # represent reviewer and auto-complete metadata differently. A missing/failed
+  # detail read never suppresses recovery, and uncached PRs need no extra read.
+  local hold_detail
+  if declare -F pr_policy_hold_present >/dev/null &&
+     pr_policy_hold_present "$pr_id" &&
+     [ -n "${REPO_ID:-}" ] &&
+     hold_detail=$(ado_api_call "${ADO_BASE}/git/repositories/${REPO_ID}/pullRequests/${pr_id}?api-version=7.1" 2>/dev/null) &&
+     pr_policy_hold_matches "$pr_id" "$hold_detail" "$policy_evals" 2>/dev/null; then
     return 1
   fi
 
