@@ -508,6 +508,19 @@ run_policy_gate() {
 
   log "🔍 Running policy gate for PR #${pr_id}..."
 
+  # Bind decisions to the exact authenticated source commit being classified.
+  # The hook exists only in the guarded router; standalone policy callers retain
+  # their existing interface. API writes refresh markers again at the boundary.
+  local PR_GUARD_POLICY_HEAD="" PR_GUARD_RISK_LEVEL="unknown"
+  if declare -F pr_guard_refresh >/dev/null; then
+    PR_GUARD_POLICY_HEAD=$(git -C "$work_dir" rev-parse HEAD) || return 1
+    pr_guard_refresh "$PR_GUARD_POLICY_HEAD" || return 1
+    # shellcheck disable=SC2153 # output from pr_guard_refresh
+    skip_auto="$SKIP_AUTO"
+    # shellcheck disable=SC2153 # output from pr_guard_refresh
+    risk_override="$RISK_OVERRIDE"
+  fi
+
   # 1. Classify risk
   local risk_json
   risk_json=$(classify_pr_risk "$pr_id" "$repo_id" "$work_dir")
@@ -515,6 +528,15 @@ run_policy_gate() {
   risk_level=$(echo "$risk_json" | jq -r '.risk // "medium"' 2>/dev/null)
   risk_level="${risk_level,,}"
   log "📊 Risk classification: ${risk_level}"
+  # shellcheck disable=SC2034 # dynamically scoped to the guarded API wrapper
+  PR_GUARD_RISK_LEVEL="$risk_level"
+  if declare -F pr_guard_refresh >/dev/null; then
+    pr_guard_refresh "$PR_GUARD_POLICY_HEAD" || return 1
+    # shellcheck disable=SC2153 # output from pr_guard_refresh
+    skip_auto="$SKIP_AUTO"
+    # shellcheck disable=SC2153 # output from pr_guard_refresh
+    risk_override="$RISK_OVERRIDE"
+  fi
 
   # 2. Check policies
   local policy_evals
@@ -556,7 +578,14 @@ run_policy_gate() {
     fi
   fi
 
-  # 5. Post transparency comment
+  # 5. Post transparency comment using current marker state as well.
+  if declare -F pr_guard_refresh >/dev/null; then
+    pr_guard_refresh "$PR_GUARD_POLICY_HEAD" || return 1
+    # shellcheck disable=SC2153 # output from pr_guard_refresh
+    skip_auto="$SKIP_AUTO"
+    # shellcheck disable=SC2153 # output from pr_guard_refresh
+    risk_override="$RISK_OVERRIDE"
+  fi
   post_risk_assessment "$pr_id" "$repo_id" "$risk_json" "$approved" "$auto_completed" "$skip_auto" "$risk_override"
 
   log "🏁 Policy gate complete (risk: ${risk_level}, approved: ${approved}, auto-complete: ${auto_completed}, skip_auto: ${skip_auto}, risk_override: ${risk_override})"

@@ -43,20 +43,21 @@ ado_api_call() {
   while [ "$attempt" -le "$max_retries" ]; do
     local auth_header
     auth_header=$(get_ado_auth_header_cached 2>/dev/null) || auth_header="Basic $(echo -n ":${ADO_PAT:-}" | b64_encode)"
+    # Feed the header on stdin so credentials never appear in curl argv.
     local http_code
     if [ -n "$body" ]; then
       http_code=$(curl -s -o "$tmpfile" -w '%{http_code}' \
         -X "$method" \
-        -H "Authorization: $auth_header" \
+        -H @- \
         -H "Content-Type: ${content_type}" \
         -d "$body" \
         --max-time 30 \
-        "$url" 2>/dev/null) || http_code="000"
+        "$url" <<< "Authorization: $auth_header" 2>/dev/null) || http_code="000"
     else
       http_code=$(curl -s -o "$tmpfile" -w '%{http_code}' \
-        -H "Authorization: $auth_header" \
+        -H @- \
         --max-time 30 \
-        "$url" 2>/dev/null) || http_code="000"
+        "$url" <<< "Authorization: $auth_header" 2>/dev/null) || http_code="000"
     fi
 
     # Auth failures — not transient, bail immediately
