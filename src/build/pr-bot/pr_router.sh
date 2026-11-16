@@ -473,6 +473,7 @@ fi
 # --- Distributed lease via ADO PR comment ---
 # Source lease functions (requires ado_api_call, ADO_BASE, log — all defined above)
 source "$SCRIPT_DIR/pr_lease.sh"
+source "$SCRIPT_DIR/pr_policy_hold.sh"
 source "$SCRIPT_DIR/pr_policies.sh"
 source "$SCRIPT_DIR/pr_analysis.sh"
 source "$SCRIPT_DIR/pr_workitems.sh"
