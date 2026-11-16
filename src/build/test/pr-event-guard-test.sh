@@ -490,7 +490,13 @@ expect_rc 1 'delayed write retry rechecks authoritative opt-out' run_retry_trans
 expect_rc 0 'no second mutation after changed marker' test "$(wc -l < "$TEST_DIR/http-mutations" | tr -d ' ')" = 1
 
 # Exercise the shipped prompt combinations without running the router or model.
-PROMPT_SETUP=$(sed -n '/^# Adjust Claude prompt/,/^# Resolve token-savior MCP binary/{ /^# Resolve token-savior MCP binary/!p; }' "$BOT/pr_router.sh")
+PROMPT_SETUP=$(awk '
+  /^# Adjust Claude prompt/ { capture=1; next }
+  /^# Resolve token-savior MCP binary/ && capture { ended=1; exit }
+  capture { print }
+  END { if (!ended) exit 1 }
+' "$BOT/pr_router.sh") || { echo "Could not bound router prompt fixture" >&2; exit 1; }
+[ -n "$PROMPT_SETUP" ] || { echo "Router prompt fixture is empty" >&2; exit 1; }
 compose_router_prompt() (
   HAS_UNRESOLVED_COMMENTS="$1"
   HAS_FAILING_BUILD="$2"
@@ -507,6 +513,7 @@ expect_review_guidance() {
   shift
   prompt=$(compose_router_prompt "$@") || return
   [[ "$prompt" == *'IMPORTANT EFFICIENCY RULES'* ]] || return 1
+  [[ "$prompt" == *'avoid unrelated or broad comment-only diffs'* ]] || return 1
   for label in 'Check each captured review thread' 'disposition for each captured thread' 'remove redundant adjacent narration'; do
     if [ "$want" = yes ]; then
       [[ "$prompt" == *"$label"* ]] || return 1
