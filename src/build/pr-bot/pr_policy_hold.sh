@@ -19,12 +19,18 @@ pr_policy_hold_key() {
   ' <<< "$pr"
 }
 
-pr_policy_hold_matches() {
-  local pr_id="$1" pr="$2" policies="$3" key file
+pr_policy_hold_present() {
+  local pr_id="$1" file
   [ -n "${STATE_DIR:-}" ] || return 1
   [[ "$pr_id" =~ ^[0-9]+$ ]] || return 1
   file="$STATE_DIR/pr-${pr_id}.policy-hold.json"
-  [ -f "$file" ] && [ ! -L "$file" ] || return 1
+  [ -f "$file" ] && [ ! -L "$file" ]
+}
+
+pr_policy_hold_matches() {
+  local pr_id="$1" pr="$2" policies="$3" key file
+  pr_policy_hold_present "$pr_id" || return 1
+  file="$STATE_DIR/pr-${pr_id}.policy-hold.json"
   key=$(pr_policy_hold_key "$pr" "$policies") || return 1
   [ -n "$key" ] && [ "$(cat "$file" 2>/dev/null)" = "$key" ]
 }

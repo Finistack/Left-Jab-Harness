@@ -524,7 +524,8 @@ run_policy_gate() {
   # A new genuine-event attempt supersedes any older terminal decision, even if
   # it later fails or the classifier is temporarily unavailable.
   if [ -n "$PR_GUARD_POLICY_HEAD" ] && declare -F pr_policy_hold_clear >/dev/null; then
-    pr_policy_hold_clear "$pr_id" || return 1
+    pr_policy_hold_clear "$pr_id" ||
+      log "⚠️ Could not clear local policy hold; continuing policy checks"
   fi
   local policy_hold_pr="${PR_DETAILS:-}"
 
