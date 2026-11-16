@@ -982,10 +982,12 @@ IMPORTANT EFFICIENCY RULES (you have limited turns):
 - Be concise in your reasoning — focus on code changes, not explanations.
 - Do NOT create work items or link work items — the bot handles work item management automatically.
 - Do NOT reply to or comment on PR review threads. Just make the code changes. The bot handles thread resolution automatically.
+- Limit architectural or code simplifications to changes that reduce a material correctness or maintenance risk; avoid unrelated or broad comment-only diffs."
+
+REVIEW_COMMENT_INSTRUCTIONS="
 - Check each captured review thread against the changed code, current callers, and applicable contract; address every captured thread with the smallest evidence-based fix.
 - In your final summary, give a concise disposition for each captured thread. Say when you could not substantiate or complete a requested fix; do not imply it was fixed.
-- In owned files you touch, remove redundant adjacent narration and keep meaningful comments concise and focused on non-obvious reasons. Preserve directives, licenses, generated/API guidance, security invariants, and comments that explain behavior.
-- Limit architectural or code simplifications to changes that reduce a material correctness or maintenance risk; avoid unrelated or broad comment-only diffs."
+- In owned files you touch, remove redundant adjacent narration and keep meaningful comments concise and focused on non-obvious reasons. Preserve directives, licenses, generated/API guidance, security invariants, and comments that explain behavior."
 
 CAPPED_NOTE=""
 if [ "$THREADS_CAPPED" = true ]; then
@@ -994,9 +996,9 @@ NOTE: This PR has $TOTAL_UNRESOLVED unresolved comment threads but only the $MAX
 fi
 
 if [ "$HAS_UNRESOLVED_COMMENTS" = true ] && [ "$HAS_FAILING_BUILD" = true ]; then
-  CLAUDE_TASK="Address the unresolved review comments on this PR AND fix the failing build. Read the relevant files, make the code changes, run L0 tests if applicable (dotnet test --filter 'TestCategory=L0' --verbosity quiet), commit and push to the PR branch (${SOURCE_BRANCH}). Summarize what you changed.${CAPPED_NOTE}${BUILD_FAILURE_CONTEXT}${EFFICIENCY_INSTRUCTIONS}"
+  CLAUDE_TASK="Address the unresolved review comments on this PR AND fix the failing build. Read the relevant files, make the code changes, run L0 tests if applicable (dotnet test --filter 'TestCategory=L0' --verbosity quiet), commit and push to the PR branch (${SOURCE_BRANCH}). Summarize what you changed.${CAPPED_NOTE}${BUILD_FAILURE_CONTEXT}${EFFICIENCY_INSTRUCTIONS}${REVIEW_COMMENT_INSTRUCTIONS}"
 elif [ "$HAS_UNRESOLVED_COMMENTS" = true ]; then
-  CLAUDE_TASK="Address the unresolved review comments on this PR. Read the relevant files, make the code changes, run L0 tests if applicable (dotnet test --filter 'TestCategory=L0' --verbosity quiet), commit and push to the PR branch (${SOURCE_BRANCH}). Summarize what you changed.${CAPPED_NOTE}${EFFICIENCY_INSTRUCTIONS}"
+  CLAUDE_TASK="Address the unresolved review comments on this PR. Read the relevant files, make the code changes, run L0 tests if applicable (dotnet test --filter 'TestCategory=L0' --verbosity quiet), commit and push to the PR branch (${SOURCE_BRANCH}). Summarize what you changed.${CAPPED_NOTE}${EFFICIENCY_INSTRUCTIONS}${REVIEW_COMMENT_INSTRUCTIONS}"
 else
   # Only failing builds, no review comments
   CLAUDE_TASK="The build validation policies are FAILING on this PR. Investigate the build failure, fix the issue, run L0 tests locally (dotnet test --filter 'TestCategory=L0' --verbosity quiet), commit and push to the PR branch (${SOURCE_BRANCH}). Summarize what you changed.${BUILD_FAILURE_CONTEXT}${EFFICIENCY_INSTRUCTIONS}"
