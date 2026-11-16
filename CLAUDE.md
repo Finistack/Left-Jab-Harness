@@ -29,6 +29,10 @@ monorepo (`src/build/...`) so it can be consumed by monorepo-style builds, and i
 - **Language:** Bash (4.3+). No package manifest. (One exception: `src/build/github-pr-review.py`,
   the CI-side GitHub review poster — stdlib-only Python, no pip deps.)
 - **Runtime deps:** `git`, `curl`, `jq`, and the `claude` CLI (Claude Code).
+- **Image toolchain:** the `dotnet/sdk` base, `NODE_MAJOR`, and `CLAUDE_CODE_VERSION` are pinned in
+  `src/build/pr-bot/Dockerfile` and kept current by Renovate (`renovate.json` +
+  `.github/workflows/renovate.yml`); the `# renovate:` annotations are guarded by
+  `src/build/test/renovate-config-test.sh`.
 - **Auth:** Azure DevOps via PAT, Entra service principal, or Workload Identity (`ADO_AUTH_METHOD`).
   The GitHub review pipeline authenticates as a separate **review bot** via `GH_REVIEW_PAT`, an
   ADO **pipeline** secret — never committed (set on the build definition; see Secrets below).

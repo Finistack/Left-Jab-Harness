@@ -8,7 +8,9 @@
 # Key constraints:
 # - Auto-complete requires ADO Engineering Contributors approval
 # - Bot approves as its own identity
-# - HIGH risk = no approve, no complete
+# - HIGH risk = no approve, no complete unless the PR title carries the explicit
+#   [risk-approved] directive (a human risk-acceptance decision); comments/builds
+#   remain hard gates.
 # - Risk classification via Claude small/fast model on PR diffs
 
 # Classify PR risk level using Claude.
@@ -55,13 +57,27 @@ Respond: {\"risk\":\"low|medium|high\",\"reasoning\":\"one sentence\"}"
   fi
   claude_args+=(-p "$prompt")
 
+  # Risk classification is a small, bounded model call, but it runs on the same host
+  # as mature PR sessions and may queue behind model throughput. Keep a generous
+  # timeout, then retry once with a short bounded prompt before failing closed.
   local result="" claude_rc=0 claude_stderr=""
+  local classify_timeout="${RISK_CLASSIFY_TIMEOUT_SECS:-300}"
   if command -v claude >/dev/null 2>&1; then
-    local stderr_file
-    stderr_file=$(mktemp 2>/dev/null || echo "${TMPDIR:-/tmp}/risk-classify-$$.err")
-    result=$(timeout 120 claude "${claude_args[@]}" 2>"$stderr_file") || claude_rc=$?
-    claude_stderr=$(cat "$stderr_file" 2>/dev/null) || true
-    rm -f "$stderr_file" 2>/dev/null || true
+    local attempt stderr_file
+    for attempt in 1 2; do
+      stderr_file=$(mktemp 2>/dev/null || echo "${TMPDIR:-/tmp}/risk-classify-$$.err")
+      result=$(timeout "$classify_timeout" claude "${claude_args[@]}" 2>"$stderr_file") || claude_rc=$?
+      claude_stderr=$(cat "$stderr_file" 2>/dev/null) || true
+      rm -f "$stderr_file" 2>/dev/null || true
+      if [ -n "$result" ] && echo "$result" | grep -oE '\{[^}]+\}' | head -1 | jq -e '.risk' >/dev/null 2>&1; then
+        break
+      fi
+      [ "$attempt" -eq 1 ] || break
+      log "⚠️  risk-classify: attempt ${attempt} unavailable (rc=${claude_rc}); retrying once" >&2
+      claude_rc=0
+      result=""
+      claude_stderr=""
+    done
   fi
 
   if [ -z "$result" ]; then
@@ -128,14 +144,16 @@ detect_policy_issues() {
 }
 
 # Auto-approve a PR (vote=10 = Approved).
-# Only for LOW/MEDIUM risk. Skips for HIGH.
-# Usage: auto_approve_pr <pr_id> <repo_id> <risk_level> [skip_auto]
+# HIGH risk is approved only with the explicit [risk-approved] PR-title directive;
+# UNKNOWN risk is always refused (we cannot attest what was accepted).
+# Usage: auto_approve_pr <pr_id> <repo_id> <risk_level> [skip_auto] [risk_override]
 # Returns: 0 on success, 1 on failure/skip
 auto_approve_pr() {
   local pr_id="$1"
   local repo_id="$2"
   local risk_level="$3"
   local skip_auto="${4:-0}"
+  local risk_override="${5:-0}"
 
   # [no-auto] opt-out — disable auto-approve while leaving comment-fixing/rebasing intact.
   if [ "$skip_auto" = "1" ]; then
@@ -143,12 +161,19 @@ auto_approve_pr() {
     return 1
   fi
 
-  if [ "$risk_level" = "high" ] || [ "$risk_level" = "unknown" ]; then
-    log "⚠️  ${risk_level^^} risk — skipping auto-approve for PR # ${pr_id}"
+  if [ "$risk_level" = "unknown" ]; then
+    log "⚠️  UNKNOWN risk — skipping auto-approve for PR #${pr_id}"
     return 1
   fi
+  if [ "$risk_level" = "high" ] && [ "$risk_override" != "1" ]; then
+    log "⚠️  HIGH risk — skipping auto-approve for PR #${pr_id} (no [risk-approved] directive)"
+    return 1
+  fi
+  if [ "$risk_level" = "high" ]; then
+    log "⚠️  HIGH risk explicitly accepted via [risk-approved] for PR #${pr_id}"
+  fi
 
-  log "👍 Auto-approving PR #${pr_id} (risk: ${risk_level})..."
+  log "👍 Auto-approving PR #${pr_id} (risk: ${risk_level}${risk_override:+; override=${risk_override}})..."
 
   # Get the bot's identity ID from the PR (we need reviewer ID)
   # Use "me" endpoint to get current user's ID
@@ -231,14 +256,16 @@ poll_build_completion() {
 }
 
 # Auto-complete a PR with squash merge.
-# Only for LOW/MEDIUM risk + all policies pass.
-# Usage: auto_complete_pr <pr_id> <repo_id> <risk_level> [skip_auto]
+# HIGH risk is allowed only with the explicit [risk-approved] PR-title directive.
+# The unresolved-comment gate below still applies to every risk level.
+# Usage: auto_complete_pr <pr_id> <repo_id> <risk_level> [skip_auto] [risk_override]
 # Returns: 0 on success, 1 on failure/skip
 auto_complete_pr() {
   local pr_id="$1"
   local repo_id="$2"
   local risk_level="$3"
   local skip_auto="${4:-0}"
+  local risk_override="${5:-0}"
 
   # [no-auto] opt-out — disable auto-complete; a human must complete the PR.
   if [ "$skip_auto" = "1" ]; then
@@ -246,8 +273,12 @@ auto_complete_pr() {
     return 1
   fi
 
-  if [ "$risk_level" = "high" ]; then
-    log "⚠️  HIGH risk — skipping auto-complete for PR #${pr_id}"
+  if [ "$risk_level" = "high" ] && [ "$risk_override" != "1" ]; then
+    log "⚠️  HIGH risk — skipping auto-complete for PR #${pr_id} (no [risk-approved] directive)"
+    return 1
+  fi
+  if [ "$risk_level" = "unknown" ]; then
+    log "⚠️  UNKNOWN risk — skipping auto-complete for PR #${pr_id}"
     return 1
   fi
 
@@ -259,7 +290,7 @@ auto_complete_pr() {
   # pr_heartbeat.sh pr_has_actionable_work), so the three gates agree exactly:
   #   - status == "active" or null  → unresolved (the bot's own status/lease/risk
   #     threads are posted status:4 = closed, so they are excluded automatically);
-  #   - exclude VoteUpdate system threads (an approval vote is not a conversation);
+  #   - exclude ADO system-event threads (vote/policy/ref/autocomplete/reviewer updates);
   #   - require ≥1 non-system comment (ignore pure system/policy threads).
   # FAIL CLOSED: if the threads API call fails we cannot prove the PR is clean, so we
   # decline to auto-complete rather than risk merging over an open thread.
@@ -284,7 +315,7 @@ auto_complete_pr() {
   unresolved_count=$(echo "$threads_json" | jq '
     [.value[]?
      | select(.status == "active" or .status == null)
-     | select(.properties.CodeReviewThreadType.["$value"] != "VoteUpdate")
+     | select(.properties.CodeReviewThreadType.["$value"] == null)
      | select([.comments[]? | select(.commentType != "system")] | length > 0)
     ] | length' 2>/dev/null || echo "unknown")
   if [ "$unresolved_count" != "0" ]; then
@@ -327,7 +358,7 @@ auto_complete_pr() {
 }
 
 # Post a transparency comment with risk assessment.
-# Usage: post_risk_assessment <pr_id> <repo_id> <risk_json> <approved> <auto_completed> [skip_auto]
+# Usage: post_risk_assessment <pr_id> <repo_id> <risk_json> <approved> <auto_completed> [skip_auto] [risk_override]
 post_risk_assessment() {
   local pr_id="$1"
   local repo_id="$2"
@@ -335,6 +366,7 @@ post_risk_assessment() {
   local approved="$4"
   local auto_completed="$5"
   local skip_auto="${6:-0}"
+  local risk_override="${7:-0}"
 
   local risk_level reasoning
   risk_level=$(echo "$risk_json" | jq -r '.risk // "unknown"' 2>/dev/null)
@@ -369,6 +401,10 @@ post_risk_assessment() {
   if [ "$skip_auto" = "1" ]; then
     no_auto_note="
 ⏸️ Auto-merge disabled via \`[no-auto]\` — human must approve & complete."
+  fi
+  if [ "$risk_level" = "high" ] && [ "$risk_override" = "1" ]; then
+    no_auto_note="${no_auto_note}
+⚠️ HIGH risk explicitly accepted via \`[risk-approved]\`; unresolved comments and build policies still gate merge."
   fi
 
   local comment_content
@@ -461,15 +497,29 @@ requeue_expired_policies() {
 }
 
 # Run the full policy gate after Claude's changes are pushed.
-# Usage: run_policy_gate <pr_id> <repo_id> <project_id> <work_dir> [skip_auto]
+# Usage: run_policy_gate <pr_id> <repo_id> <project_id> <work_dir> [skip_auto] [risk_override]
 run_policy_gate() {
   local pr_id="$1"
   local repo_id="$2"
   local project_id="$3"
   local work_dir="$4"
   local skip_auto="${5:-0}"
+  local risk_override="${6:-0}"
 
   log "🔍 Running policy gate for PR #${pr_id}..."
+
+  # Bind decisions to the exact authenticated source commit being classified.
+  # The hook exists only in the guarded router; standalone policy callers retain
+  # their existing interface. API writes refresh markers again at the boundary.
+  local PR_GUARD_POLICY_HEAD="" PR_GUARD_RISK_LEVEL="unknown"
+  if declare -F pr_guard_refresh >/dev/null; then
+    PR_GUARD_POLICY_HEAD=$(git -C "$work_dir" rev-parse HEAD) || return 1
+    pr_guard_refresh "$PR_GUARD_POLICY_HEAD" || return 1
+    # shellcheck disable=SC2153 # output from pr_guard_refresh
+    skip_auto="$SKIP_AUTO"
+    # shellcheck disable=SC2153 # output from pr_guard_refresh
+    risk_override="$RISK_OVERRIDE"
+  fi
 
   # 1. Classify risk
   local risk_json
@@ -478,6 +528,15 @@ run_policy_gate() {
   risk_level=$(echo "$risk_json" | jq -r '.risk // "medium"' 2>/dev/null)
   risk_level="${risk_level,,}"
   log "📊 Risk classification: ${risk_level}"
+  # shellcheck disable=SC2034 # dynamically scoped to the guarded API wrapper
+  PR_GUARD_RISK_LEVEL="$risk_level"
+  if declare -F pr_guard_refresh >/dev/null; then
+    pr_guard_refresh "$PR_GUARD_POLICY_HEAD" || return 1
+    # shellcheck disable=SC2153 # output from pr_guard_refresh
+    skip_auto="$SKIP_AUTO"
+    # shellcheck disable=SC2153 # output from pr_guard_refresh
+    risk_override="$RISK_OVERRIDE"
+  fi
 
   # 2. Check policies
   local policy_evals
@@ -493,27 +552,41 @@ run_policy_gate() {
   # 2b. Requeue stale/expired build policies before approval
   requeue_expired_policies "$pr_id" "$project_id" "$policy_evals"
 
-  # 3. Auto-approve (LOW/MEDIUM only)
-  if auto_approve_pr "$pr_id" "$repo_id" "$risk_level" "$skip_auto"; then
+  # 3. Auto-approve (LOW/MEDIUM, or HIGH with explicit [risk-approved])
+  if auto_approve_pr "$pr_id" "$repo_id" "$risk_level" "$skip_auto" "$risk_override"; then
     approved="true"
   fi
 
-  # 4. Wait for policies to settle, then try auto-complete
-  if [ "$risk_level" != "high" ] && [ "$risk_level" != "unknown" ] && [ "$issue_count" = "0" ]; then
+  # 4. Wait for policies to settle, then try auto-complete. HIGH is eligible only
+  #    through the same explicit override; UNKNOWN is never eligible.
+  local risk_eligible=0
+  if [ "$risk_level" = "low" ] || [ "$risk_level" = "medium" ]; then
+    risk_eligible=1
+  elif [ "$risk_level" = "high" ] && [ "$risk_override" = "1" ]; then
+    risk_eligible=1
+  fi
+  if [ "$risk_eligible" = "1" ] && [ "$issue_count" = "0" ]; then
     # All policies passing — set auto-complete
-    if auto_complete_pr "$pr_id" "$repo_id" "$risk_level" "$skip_auto"; then
+    if auto_complete_pr "$pr_id" "$repo_id" "$risk_level" "$skip_auto" "$risk_override"; then
       auto_completed="true"
     fi
-  elif [ "$risk_level" != "high" ] && [ "$risk_level" != "unknown" ] && [ "$issue_count" -gt 0 ]; then
+  elif [ "$risk_eligible" = "1" ] && [ "$issue_count" -gt 0 ]; then
     # Policies still pending/failing — just set auto-complete and let ADO handle it
     log "⏳ $issue_count policy issues pending, setting auto-complete to trigger when ready..."
-    if auto_complete_pr "$pr_id" "$repo_id" "$risk_level" "$skip_auto"; then
+    if auto_complete_pr "$pr_id" "$repo_id" "$risk_level" "$skip_auto" "$risk_override"; then
       auto_completed="true"
     fi
   fi
 
-  # 5. Post transparency comment
-  post_risk_assessment "$pr_id" "$repo_id" "$risk_json" "$approved" "$auto_completed" "$skip_auto"
+  # 5. Post transparency comment using current marker state as well.
+  if declare -F pr_guard_refresh >/dev/null; then
+    pr_guard_refresh "$PR_GUARD_POLICY_HEAD" || return 1
+    # shellcheck disable=SC2153 # output from pr_guard_refresh
+    skip_auto="$SKIP_AUTO"
+    # shellcheck disable=SC2153 # output from pr_guard_refresh
+    risk_override="$RISK_OVERRIDE"
+  fi
+  post_risk_assessment "$pr_id" "$repo_id" "$risk_json" "$approved" "$auto_completed" "$skip_auto" "$risk_override"
 
-  log "🏁 Policy gate complete (risk: ${risk_level}, approved: ${approved}, auto-complete: ${auto_completed}, skip_auto: ${skip_auto})"
+  log "🏁 Policy gate complete (risk: ${risk_level}, approved: ${approved}, auto-complete: ${auto_completed}, skip_auto: ${skip_auto}, risk_override: ${risk_override})"
 }

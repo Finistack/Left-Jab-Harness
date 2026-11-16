@@ -1,0 +1,58 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":dependencyDashboard"
+  ],
+  "timezone": "Australia/Sydney",
+  "schedule": [
+    "before 6am on monday"
+  ],
+  "labels": [
+    "renovate",
+    "dependencies"
+  ],
+  "prConcurrentLimit": 5,
+  "prHourlyLimit": 2,
+  "packageRules": [
+    {
+      "description": "Group non-major toolchain bumps (dotnet SDK base, Node major, Claude Code CLI) into one PR so the fat image rebuilds once and the SBOM records a coherent toolchain. The pins are annotated in src/build/pr-bot/Dockerfile: the built-in dockerfile manager reads the FROM line, and the custom manager below reads the ARG lines.",
+      "matchManagers": [
+        "dockerfile",
+        "custom.regex"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "pin",
+        "digest"
+      ],
+      "groupName": "left-jab-harness image toolchain (non-major)"
+    },
+    {
+      "description": "Keep major toolchain bumps (for example dotnet SDK 10 -> 11 or Node 20 -> 24) in their own PR so a breaking runtime change is reviewed and canaried in isolation from routine patches.",
+      "matchManagers": [
+        "dockerfile",
+        "custom.regex"
+      ],
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "groupName": "left-jab-harness image toolchain (major)"
+    }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Build-arg toolchain pins in the harness Dockerfile. The built-in dockerfile manager only reads FROM lines, so NODE_MAJOR and CLAUDE_CODE_VERSION need an explicit manager driven by '# renovate:' annotations. NODE_MAJOR keeps a bare-major format (the NodeSource apt repo URL requires it) via versioning=node.",
+      "managerFilePatterns": [
+        "/^src/build/pr-bot/Dockerfile$/"
+      ],
+      "matchStrings": [
+        "#\\s*renovate:\\s*datasource=(?<datasource>\\S+)\\s+depName=(?<depName>\\S+)(?:\\s+versioning=(?<versioning>\\S+))?\\s*\\nARG\\s+\\w+=(?<currentValue>\\S+)"
+      ],
+      "datasourceTemplate": "{{{datasource}}}",
+      "versioningTemplate": "{{#if versioning}}{{{versioning}}}{{else}}{{{datasource}}}{{/if}}"
+    }
+  ]
+}
