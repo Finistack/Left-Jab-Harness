@@ -39,7 +39,11 @@ try:
     socket.relative_to(slot)
 except ValueError:
     raise SystemExit('CI preflight: Docker socket must belong to the assigned agent work-folder parent')
-if not stat.S_ISSOCK(socket.stat().st_mode):
+try:
+    socket_mode = socket.stat().st_mode
+except OSError as exc:
+    raise SystemExit(f'CI preflight: cannot access assigned Docker socket: {exc.strerror}')
+if not stat.S_ISSOCK(socket_mode):
     raise SystemExit('CI preflight: assigned Docker endpoint is not a Unix socket')
 PY
     docker info --format '{{.ServerVersion}}' >/dev/null
@@ -65,6 +69,20 @@ owned_job_dir() {
     || fail 'refusing cleanup outside a direct job temporary directory'
   [[ ! -L "$CI_JOB_DIR" && -f "$CI_JOB_DIR/.job-id" ]] || fail 'missing job ownership marker'
   [[ "$(cat "$CI_JOB_DIR/.job-id")" == "${SYSTEM_JOBID:?}" ]] || fail 'job ownership mismatch'
+}
+
+record_image_ref() {
+  owned_job_dir || fail 'missing job state for recording image reference'
+  local ref="${1:?image reference required}" manifest="$CI_JOB_DIR/published-image-refs" status
+  if [[ -e "$manifest" ]]; then
+    if grep -Fxq -- "$ref" "$manifest"; then
+      return 0
+    else
+      status=$?
+      [[ "$status" == 1 ]] || return "$status"
+    fi
+  fi
+  printf '%s\n' "$ref" >> "$manifest"
 }
 
 image_id_or_absent() {
@@ -116,7 +134,8 @@ cleanup() {
 case "${1:-}" in
   prepare) prepare "${2:?job kind required}" ;;
   check-node) check_node ;;
+  record-image-ref) record_image_ref "${2:-}" ;;
   cleanup-image) cleanup_image ;;
   cleanup) cleanup ;;
-  *) fail 'usage: ci-job.sh {prepare lint|build|review|check-node|cleanup-image|cleanup}' ;;
+  *) fail 'usage: ci-job.sh {prepare lint|build|review|check-node|record-image-ref REF|cleanup-image|cleanup}' ;;
 esac

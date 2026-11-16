@@ -189,9 +189,11 @@ stages:
                 source src/build/acr-scoped-login.sh
                 acr_scoped_login
                 for tag in "$IMAGE_TAG" "$SOURCE_VERSION" latest; do
-                  docker tag "$LOCAL_IMAGE" "$CONTAINER_REGISTRY/$IMAGE_REPOSITORY:$tag"
-                  printf '%s\n' "$CONTAINER_REGISTRY/$IMAGE_REPOSITORY:$tag" >> "$CI_JOB_DIR/published-image-refs"
-                  docker push "$CONTAINER_REGISTRY/$IMAGE_REPOSITORY:$tag"
+                  ref="$CONTAINER_REGISTRY/$IMAGE_REPOSITORY:$tag"
+                  docker tag "$LOCAL_IMAGE" "$ref"
+                  # Record before push so a partial failure is still cleaned up.
+                  bash src/build/ci-job.sh record-image-ref "$ref"
+                  docker push "$ref"
                 done
             env:
               CI_JOB_DIR: $(ciJobDir)

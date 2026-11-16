@@ -111,13 +111,25 @@ esac''')
         check(result.returncode != 0, message)
         check(log.read_text() == before, message + ' before Docker invocation')
     before = log.read_text()
+    result = run('prepare', 'build', overrides={'DOCKER_HOST': 'unix://' + str(slot / 'missing.sock')})
+    check(result.returncode != 0 and 'CI preflight: cannot access assigned Docker socket' in result.stderr
+          and 'Traceback' not in result.stderr, 'missing private socket fails with a clear preflight diagnostic')
+    check(log.read_text() == before, 'missing private socket never invokes Docker')
     result = run('cleanup-image', overrides={'CI_JOB_DIR': '$(ciJobDir)', 'DOCKER_HOST': ''})
     check(result.returncode == 0 and log.read_text() == before, 'cleanup after failed prepare never invokes Docker')
     result = run('cleanup', overrides={'CI_JOB_DIR': '$(ciJobDir)'})
     check(result.returncode == 0, 'temporary cleanup after failed prepare is a no-op')
 
     refs = ['registry.example/harness:owned', 'registry.example/harness:foreign', 'registry.example/harness:missing']
-    (first / 'published-image-refs').write_text('\n'.join(refs) + '\n')
+    for ref in refs + refs:
+        result = run('record-image-ref', ref, overrides={'CI_JOB_DIR': str(first)})
+        check(result.returncode == 0, 'record image ref before push or retry')
+    check((first / 'published-image-refs').read_text().splitlines() == refs,
+          'retry keeps one cleanup entry per ref, including refs from uncertain pushes')
+    result = run('record-image-ref', 'registry.example/harness:other-job',
+                 overrides={'CI_JOB_DIR': str(first), 'SYSTEM_JOBID': 'other-job'})
+    check(result.returncode != 0 and (first / 'published-image-refs').read_text().splitlines() == refs,
+          'recording refuses another job directory')
     result = run('cleanup-image', overrides={'CI_JOB_DIR': str(first)})
     check(result.returncode == 0, 'owned image cleanup succeeds')
     removed = [x[len('image rm '):] for x in log.read_text().splitlines() if x.startswith('image rm ')]
@@ -252,7 +264,8 @@ check('REVIEW_FILE: $(ciJobDir)/review-results.json' in review, 'poster reads th
 check('/tmp/pr-diff' not in review and '/tmp/review-results' not in review and '/tmp/claude-stderr' not in review, 'review has no shared temporary filenames')
 check("condition: and(always(), eq(variables['reviewResultsReady'], 'true'))" in review, 'artifact skips when Node/npm/review failed before output creation')
 check("condition: and(always(), ne(variables['ciJobDir'], ''))" in build, 'Docker cleanup is gated on successful prepare')
-check('published-image-refs' in build, 'push records only job-created remote image refs')
+check('record-image-ref "$ref"' in build and build.index('record-image-ref "$ref"') < build.index('docker push "$ref"'),
+      'push records job-created image refs before attempting the upload')
 check('pr:\n  branches:\n    include:\n      - main' in review and 'trigger: none' in review, 'normal review PR trigger is preserved')
 
 # Exercise the actual inline review script with fake git/Claude, including concurrent state.
